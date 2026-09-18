@@ -78,12 +78,17 @@ else()
   target_link_libraries(mango_nn PUBLIC mango_core)
 endif()
 
+# Search (PUCT). Depends only on the evaluator interface, not on LibTorch.
+add_library(mango_search STATIC cpp/search/mcts.cpp)
+target_link_libraries(mango_search PUBLIC mango_core mango_nn)
+
 # GTP front-end library + executable.
-add_library(mango_gtp_lib STATIC cpp/gtp/gtp.cpp)
-target_link_libraries(mango_gtp_lib PUBLIC mango_core)
+add_library(mango_gtp_lib STATIC cpp/gtp/gtp.cpp cpp/gtp/mcts_player.cpp)
+target_link_libraries(mango_gtp_lib PUBLIC mango_core mango_search)
 
 add_executable(mango_gtp cpp/gtp/gtp_main.cpp)
-target_link_libraries(mango_gtp PRIVATE mango_gtp_lib)
+target_link_libraries(mango_gtp PRIVATE mango_gtp_lib mango_nn)
+mango_copy_torch_dlls(mango_gtp)
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -96,12 +101,14 @@ if(MANGO_BUILD_TESTS)
     cpp/tests/test_history.cpp
     cpp/tests/test_symmetry.cpp
     cpp/tests/test_sgf_config.cpp
-    cpp/tests/test_gtp.cpp)
+    cpp/tests/test_gtp.cpp
+    cpp/tests/test_mcts.cpp
+    cpp/tests/test_mcts_player.cpp)
   if(MANGO_WITH_TORCH)
     target_sources(mango_tests PRIVATE cpp/tests/test_torch_eval.cpp)
   endif()
   target_compile_definitions(mango_tests PRIVATE MANGO_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/cpp/tests/fixtures")
-  target_link_libraries(mango_tests PRIVATE mango_core mango_nn mango_gtp_lib)
+  target_link_libraries(mango_tests PRIVATE mango_core mango_nn mango_search mango_gtp_lib)
   add_test(NAME mango_tests COMMAND mango_tests)
   mango_copy_torch_dlls(mango_tests)
 endif()
