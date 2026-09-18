@@ -1,0 +1,58 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "windows-msvc",
+      "displayName": "Windows / MSVC (Visual Studio 2026, x64)",
+      "generator": "Visual Studio 18 2026",
+      "architecture": { "value": "x64", "strategy": "set" },
+      "binaryDir": "${sourceDir}/build/windows",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    },
+    {
+      "name": "windows-cuda",
+      "displayName": "Windows / MSVC + LibTorch CUDA",
+      "inherits": "windows-msvc",
+      "binaryDir": "${sourceDir}/build/windows-cuda",
+      "cacheVariables": { "MANGO_WITH_TORCH": "ON" }
+    },
+    {
+      "name": "macos",
+      "displayName": "macOS / AppleClang + Ninja",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/macos",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" }
+    },
+    {
+      "name": "macos-mps",
+      "displayName": "macOS / AppleClang + LibTorch MPS",
+      "inherits": "macos",
+      "binaryDir": "${sourceDir}/build/macos-mps",
+      "cacheVariables": { "MANGO_WITH_TORCH": "ON" }
+    },
+    {
+      "name": "linux",
+      "displayName": "Linux / GCC or Clang + Ninja",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "windows-msvc", "configurePreset": "windows-msvc", "configuration": "Release" },
+    { "name": "windows-cuda", "configurePreset": "windows-cuda", "configuration": "Release" },
+    { "name": "macos", "configurePreset": "macos" },
+    { "name": "macos-mps", "configurePreset": "macos-mps" },
+    { "name": "linux", "configurePreset": "linux" }
+  ],
+  "testPresets": [
+    { "name": "windows-msvc", "configurePreset": "windows-msvc", "configuration": "Release", "output": { "outputOnFailure": true } },
+    { "name": "windows-cuda", "configurePreset": "windows-cuda", "configuration": "Release", "output": { "outputOnFailure": true } },
+    { "name": "macos", "configurePreset": "macos", "output": { "outputOnFailure": true } },
+    { "name": "macos-mps", "configurePreset": "macos-mps", "output": { "outputOnFailure": true } },
+    { "name": "linux", "configurePreset": "linux", "output": { "outputOnFailure": true } }
+  ]
+}

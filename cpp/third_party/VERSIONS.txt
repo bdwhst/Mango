@@ -1,0 +1,2 @@
+doctest v2.5.3
+nlohmann/json v3.12.0
