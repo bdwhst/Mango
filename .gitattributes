@@ -1,0 +1,5 @@
+# Vendored single-header libraries: never show their content in diffs, and let
+# GitHub collapse/skip them in reviews and language statistics.
+cpp/third_party/** -diff -text linguist-vendored
+# Test fixtures: binary blobs, keep line endings untouched.
+cpp/tests/fixtures/** -diff -text

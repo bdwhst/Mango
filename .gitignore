@@ -1,0 +1,30 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# C++ build
+build/
+build-*/
+out/
+CMakeUserPresets.json
+.cache/
+
+# Training artifacts (large)
+runs/
+data/
+*.pt
+*.pth
+*.mgo
+*.sgf
+
+# IDE / OS
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Committed test fixtures (small) are exempt from the artifact rules above
+!cpp/tests/fixtures/**

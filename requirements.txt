@@ -1,0 +1,6 @@
+# Install with the platform-specific index (see scripts/setup_env.*):
+#   Windows (CUDA 13.0): pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu130
+#   macOS  (MPS):        pip install -r requirements.txt
+torch==2.14.0
+numpy>=2.0
+pytest>=8.0
