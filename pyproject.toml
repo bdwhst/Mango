@@ -1,0 +1,10 @@
+[project]
+name = "mango"
+version = "0.1.0"
+description = "AlphaGo Zero reproduction (training side)"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["python/tests"]
+pythonpath = ["python"]
+addopts = "-q"

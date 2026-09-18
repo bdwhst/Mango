@@ -64,6 +64,20 @@ add_library(mango_core STATIC
 target_include_directories(mango_core PUBLIC cpp cpp/third_party)
 target_link_libraries(mango_core PUBLIC mango_flags)
 
+# Neural-network layer: metadata always; the LibTorch evaluator only with MANGO_WITH_TORCH.
+if(MANGO_WITH_TORCH)
+  add_library(mango_nn STATIC cpp/nn/model_meta.cpp cpp/nn/torch_evaluator.cpp)
+  target_link_libraries(mango_nn PUBLIC mango_core "${TORCH_LIBRARIES}")
+  target_compile_definitions(mango_nn PUBLIC MANGO_WITH_TORCH=1)
+  if(MSVC)
+    # LibTorch headers instantiate STL templates that trip C4267/C4244 under /W4.
+    target_compile_options(mango_nn PRIVATE /wd4267 /wd4244 /wd4251 /wd4275 /wd4702)
+  endif()
+else()
+  add_library(mango_nn STATIC cpp/nn/model_meta.cpp)
+  target_link_libraries(mango_nn PUBLIC mango_core)
+endif()
+
 # GTP front-end library + executable.
 add_library(mango_gtp_lib STATIC cpp/gtp/gtp.cpp)
 target_link_libraries(mango_gtp_lib PUBLIC mango_core)
@@ -83,6 +97,11 @@ if(MANGO_BUILD_TESTS)
     cpp/tests/test_symmetry.cpp
     cpp/tests/test_sgf_config.cpp
     cpp/tests/test_gtp.cpp)
-  target_link_libraries(mango_tests PRIVATE mango_core mango_gtp_lib)
+  if(MANGO_WITH_TORCH)
+    target_sources(mango_tests PRIVATE cpp/tests/test_torch_eval.cpp)
+  endif()
+  target_compile_definitions(mango_tests PRIVATE MANGO_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/cpp/tests/fixtures")
+  target_link_libraries(mango_tests PRIVATE mango_core mango_nn mango_gtp_lib)
   add_test(NAME mango_tests COMMAND mango_tests)
+  mango_copy_torch_dlls(mango_tests)
 endif()
