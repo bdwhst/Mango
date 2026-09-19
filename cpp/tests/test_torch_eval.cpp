@@ -47,13 +47,15 @@ Reference loadReference(const std::string& dir) {
   return r;
 }
 
-void checkAgainstReference(TorchEvaluator& ev, const Reference& ref, bool half) {
+// Returns the largest |policy - reference| over all rows and actions.
+double checkAgainstReference(TorchEvaluator& ev, const Reference& ref, bool half) {
   std::vector<NNInput> in;
   for (const auto& row : ref.inputs) in.push_back(NNInput{row.data()});
   std::vector<NNOutput> out;
   ev.evaluate(in, out);
   REQUIRE(out.size() == ref.inputs.size());
   const int na = ref.n * ref.n + 1;
+  double worst = 0.0;
   for (size_t i = 0; i < out.size(); ++i) {
     REQUIRE(static_cast<int>(out[i].policy.size()) == na);
     double sum = 0.0, kl = 0.0, maxAbs = 0.0;
@@ -72,6 +74,7 @@ void checkAgainstReference(TorchEvaluator& ev, const Reference& ref, bool half) 
       CHECK(maxAbs < 1e-4);
       CHECK(std::fabs(out[i].value - ref.values[i]) < 1e-4);
     }
+    worst = std::max(worst, std::max(maxAbs, static_cast<double>(std::fabs(out[i].value - ref.values[i]))));
   }
   // Batch of 1 equals the batched result row-wise.
   for (size_t i = 0; i < in.size(); ++i) {
@@ -83,6 +86,7 @@ void checkAgainstReference(TorchEvaluator& ev, const Reference& ref, bool half) 
     for (int a = 0; a < na; ++a) CHECK(std::fabs(o1[0].policy[a] - out[i].policy[a]) < tol);
     CHECK(std::fabs(o1[0].value - out[i].value) < tol);
   }
+  return worst;
 }
 
 const std::string kFixture = std::string(MANGO_FIXTURE_DIR) + "/model_5x5_v1";
@@ -124,13 +128,35 @@ TEST_CASE("torch evaluator matches the PyTorch reference on CUDA (fp32 and fp16)
     return;
   }
   Reference ref = loadReference(kFixture);
+  // TF32 is what LibTorch would use for fp32 convolutions by default. Measure its error
+  // first (loose bound only: it is an Ampere+ hardware property, not a contract) so the
+  // strict fp32 run below is known to be exercised with TF32 off, not passing by luck.
+  double tf32Err = 0.0;
   {
     TorchEvaluator::Options o;
     o.device = "cuda";
     o.fp16 = false;
+    o.allowTf32 = true;
     TorchEvaluator ev(kFixture, o);
+    std::vector<NNInput> in;
+    for (const auto& row : ref.inputs) in.push_back(NNInput{row.data()});
+    std::vector<NNOutput> out;
+    ev.evaluate(in, out);
+    for (size_t i = 0; i < out.size(); ++i) {
+      for (size_t a = 0; a < out[i].policy.size(); ++a)
+        tf32Err = std::max(tf32Err, static_cast<double>(std::fabs(out[i].policy[a] - ref.policy[i][a])));
+      tf32Err = std::max(tf32Err, static_cast<double>(std::fabs(out[i].value - ref.values[i])));
+    }
+    CHECK(tf32Err < 1e-2);
+  }
+  {
+    TorchEvaluator::Options o;
+    o.device = "cuda";
+    o.fp16 = false;
+    TorchEvaluator ev(kFixture, o);  // allowTf32 defaults to false
     CHECK_FALSE(ev.isHalf());
-    checkAgainstReference(ev, ref, false);
+    const double err = checkAgainstReference(ev, ref, false);
+    MESSAGE("CUDA max abs error vs PyTorch fp32 reference: fp32=" << err << " tf32=" << tf32Err);
   }
   {
     TorchEvaluator::Options o;

@@ -83,7 +83,7 @@ add_library(mango_search STATIC cpp/search/mcts.cpp)
 target_link_libraries(mango_search PUBLIC mango_core mango_nn)
 
 # GTP front-end library + executable.
-add_library(mango_gtp_lib STATIC cpp/gtp/gtp.cpp cpp/gtp/mcts_player.cpp)
+add_library(mango_gtp_lib STATIC cpp/gtp/gtp.cpp cpp/gtp/gtp_options.cpp cpp/gtp/mcts_player.cpp)
 target_link_libraries(mango_gtp_lib PUBLIC mango_core mango_search)
 
 add_executable(mango_gtp cpp/gtp/gtp_main.cpp)

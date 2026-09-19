@@ -1,4 +1,5 @@
 // MctsPlayer through the GTP engine with a FakeEvaluator.
+#include <cmath>
 #include <memory>
 
 #include "doctest/doctest.h"
@@ -41,8 +42,17 @@ TEST_CASE("mcts player rejects board sizes that do not match the model") {
 }
 
 TEST_CASE("mcts player reuses the tree across the opponent's move") {
-  FakeEvaluator ev(5, 0.1f);
-  auto owned = std::make_unique<MctsPlayer>(ev, params(30), 3);
+  // A sharply peaked prior (lowest empty point first) keeps the search on one line, so the
+  // opponent's best reply has a subtree worth inheriting. With a uniform prior and 30
+  // simulations the reply subtree had 0 visits and this test could not tell reuse from rebuild.
+  FakeEvaluator ev(5, [](const uint8_t* planes, float* policy, float* value) {
+    (void)planes;
+    for (int p = 0; p < 25; ++p) policy[p] = std::exp(-0.7f * static_cast<float>(p));
+    policy[25] = 1e-4f;
+    *value = 0.0f;
+  });
+  const int sims = 120;
+  auto owned = std::make_unique<MctsPlayer>(ev, params(sims), 3);
   MctsPlayer* player = owned.get();
   GtpEngine e(std::move(owned), 5, 7.5f);
   bool quit;
@@ -68,13 +78,14 @@ TEST_CASE("mcts player reuses the tree across the opponent's move") {
     if (ed.N > 0 && (!reply || ed.N > reply->N)) reply = &ed;
   REQUIRE(reply != nullptr);
   const uint32_t replyChildVisits = reply->N - 1;  // edge N == child visitCount; inherited = child's edge sum
+  REQUIRE(replyChildVisits > 0);  // otherwise "inherited == 0" would also hold for a rebuilt tree
   std::string wm = GtpEngine::vertexToString(reply->move, 5);
   REQUIRE(e.handle("play w " + wm, &quit) == "=");
   REQUIRE(e.handle("genmove b", &quit).rfind("= ", 0) == 0);
   // Two moves were appended (black's and white's): the tree must have been advanced
   // through both, so the new root inherited the reply's subtree.
   CHECK(player->tree()->inheritedVisits() == replyChildVisits);
-  CHECK(player->tree()->rootTotalVisits() == replyChildVisits + 30);
+  CHECK(player->tree()->rootTotalVisits() == replyChildVisits + sims);
   CHECK(player->tree()->checkInvariants() == "");
 
   // An undo breaks the prefix: the tree is rebuilt, not reused.

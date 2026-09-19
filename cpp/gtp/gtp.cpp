@@ -47,7 +47,7 @@ Move RandomPlayer::genmove(const Board& board, const GameHistory& hist) {
   return legal_[rng_.uniformInt(static_cast<uint32_t>(legal_.size() - 1))];
 }
 
-GtpEngine::GtpEngine(std::unique_ptr<Player> player, int size, float komi, float modelKomi)
+GtpEngine::GtpEngine(std::unique_ptr<Player> player, int size, float komi, std::optional<float> modelKomi)
     : player_(std::move(player)), size_(size), komi_(komi), modelKomi_(modelKomi), board_(size, komi) {
   hist_.reset(board_.hash());
 }
@@ -169,8 +169,8 @@ std::string GtpEngine::handle(const std::string& rawLine, bool* quit) {
   if (cmd == "komi") {
     if (tok.size() < 2) return err("syntax error");
     float k = static_cast<float>(std::atof(tok[1].c_str()));
-    if (modelKomi_ >= 0 && k != modelKomi_)
-      return err("unsupported komi " + tok[1] + "; this model was trained with " + std::to_string(modelKomi_));
+    if (modelKomi_ && k != *modelKomi_)
+      return err("unsupported komi " + tok[1] + "; this model was trained with " + std::to_string(*modelKomi_));
     komi_ = k;
     replayAll();
     return ok("");

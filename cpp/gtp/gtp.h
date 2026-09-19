@@ -4,6 +4,7 @@
 
 #include <iosfwd>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -41,7 +42,9 @@ class RandomPlayer : public Player {
 
 class GtpEngine {
  public:
-  GtpEngine(std::unique_ptr<Player> player, int size, float komi, float modelKomi = -1.0f);
+  // modelKomi: the only komi the "komi" command accepts (a network is komi-specific);
+  // nullopt accepts any komi.
+  GtpEngine(std::unique_ptr<Player> player, int size, float komi, std::optional<float> modelKomi = std::nullopt);
   // Runs the command loop until "quit" or EOF. Returns 0.
   int run(std::istream& in, std::ostream& out);
   // Handles one command line; returns the full response (without trailing blank line)
@@ -64,7 +67,7 @@ class GtpEngine {
   std::unique_ptr<Player> player_;
   int size_;
   float komi_;
-  float modelKomi_;  // <0: any komi accepted
+  std::optional<float> modelKomi_;  // nullopt: any komi accepted
   Board board_;
   GameHistory hist_;
   std::vector<Color> colors_;  // colour of each move in hist_ (GTP moves need not alternate)

@@ -3,6 +3,7 @@
 #include <cstring>
 #include <stdexcept>
 
+#include <ATen/Context.h>
 #include <torch/cuda.h>
 #include <torch/mps.h>
 #include <torch/script.h>
@@ -30,6 +31,10 @@ TorchEvaluator::TorchEvaluator(const std::string& modelDir, const Options& optio
   if (dev == "cuda") {
     if (!cudaAvailable()) throw std::runtime_error("CUDA requested but not available");
     impl_->device = torch::Device(torch::kCUDA);
+    // Process-wide flags (there is one ATen context); every evaluator in a process sets
+    // them the same way, so the last constructed one wins harmlessly.
+    at::globalContext().setAllowTF32CuDNN(options.allowTf32);
+    at::globalContext().setAllowTF32CuBLAS(options.allowTf32);
   } else if (dev == "mps") {
     if (!mpsAvailable()) throw std::runtime_error("MPS requested but not available");
     impl_->device = torch::Device(torch::kMPS);

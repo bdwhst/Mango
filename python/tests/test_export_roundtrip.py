@@ -1,6 +1,7 @@
 import json
 import re
 
+import pytest
 import torch
 
 from mango.export import export_model_version, load_eager_model, load_metadata, make_model_id
@@ -54,20 +55,38 @@ def test_export_roundtrip(tmp_path):
     assert not any(p.name.startswith(".tmp-") for p in (tmp_path / "models").iterdir())
 
 
-def test_export_does_not_touch_the_live_model(tmp_path):
+def _available_devices():
+    devices = ["cpu"]
+    if torch.cuda.is_available():
+        devices.append("cuda")
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        devices.append("mps")
+    return devices
+
+
+@pytest.mark.parametrize("device", _available_devices())
+def test_export_does_not_touch_the_live_model(tmp_path, device):
     torch.manual_seed(5)
-    model = AGZNet(5, 1, 8).train()
+    model = AGZNet(5, 1, 8).to(device).train()
     before = {k: v.clone() for k, v in model.state_dict().items()}
-    device_before = next(model.parameters()).device
+    # Identity of the parameter objects and their storage: an in-place .cpu()/.float()
+    # on a CPU model is a no-op, so on the CPU row only these checks (and .training)
+    # can catch an export that mutates the live model. Accelerator rows also catch .cpu().
+    params_before = [p for p in model.parameters()]
+    ptrs_before = [p.data_ptr() for p in params_before]
     export_model_version(model, tmp_path, iteration=1, komi=7.5, move_cap=50)
     assert model.training, "export switched the live model to eval mode"
-    assert next(model.parameters()).device == device_before
+    assert all(p is q for p, q in zip(params_before, model.parameters()))
+    assert [p.data_ptr() for p in model.parameters()] == ptrs_before
+    for p in model.parameters():
+        assert p.device.type == device, p.device
     for k, v in model.state_dict().items():
+        assert v.device.type == device, k
         assert torch.equal(v, before[k]), k
     # A subsequent training step still updates BN running statistics (train mode).
     stats_before = model.stem_bn.running_mean.clone()
     with torch.no_grad():
-        model(torch.randint(0, 2, (4, 17, 5, 5)).float())
+        model(torch.randint(0, 2, (4, 17, 5, 5), device=device).float())
     assert not torch.equal(model.stem_bn.running_mean, stats_before)
 
 

@@ -99,7 +99,7 @@ Mango/
     search/    node.h/.cpp   mcts.h/.cpp   search_params.h
     selfplay/  game_runner.h/.cpp  chunk_writer.h/.cpp  selfplay_main.cpp
     match/     match_main.cpp
-    gtp/       gtp.h/.cpp    gtp_main.cpp
+    gtp/       gtp.h/.cpp    gtp_options.h/.cpp  mcts_player.h/.cpp  gtp_main.cpp
     tests/     ref_board.h/.cpp  test_board.cpp  test_rules.cpp  test_history.cpp  test_features.cpp  test_symmetry.cpp
                test_mcts.cpp  test_mcts_batched.cpp  test_chunk.cpp  test_torch_eval.cpp
     third_party/doctest/  doctest.h  LICENSE.txt        (vendored, MIT, version pinned in README)
@@ -442,7 +442,7 @@ Derived by the loader, never stored: planes for position `t` come from snapshots
 
 ### 5.7 GTP front-end (`cpp/gtp`)
 
-Minimal GTP v2: `protocol_version, name, version, boardsize, clear_board, komi, play, genmove, undo, final_score, showboard, list_commands, known_command, quit`, plus `mango-analyze` (top moves with N/Q/P). `undo` is implemented by replaying the game history from the start (cheap) and **discards the search tree** (§5.4.8). Enough for GoGui, Sabaki and `gogui-twogtp` matches against GNU Go or KataGo.
+Minimal GTP v2: `protocol_version, name, version, boardsize, clear_board, komi, play, genmove, undo, final_score, showboard, list_commands, known_command, quit`, plus `mango-analyze` (top moves with N/Q/P). `undo` is implemented by replaying the game history from the start (cheap) and **discards the search tree** (§5.4.8). Command-line precedence (`gtp_options.cpp`, unit-tested): `--size`/`--komi`/`--sims` > model metadata (size, komi) > config file > defaults; `--komi` may be negative; with `--allow-komi-mismatch` both the start-up check and the GTP `komi` command are unrestricted, otherwise `komi` must equal the model's komi (whatever its sign). Enough for GoGui, Sabaki and `gogui-twogtp` matches against GNU Go or KataGo.
 
 ### 5.8 Match driver (`cpp/match`) and evaluation validity
 

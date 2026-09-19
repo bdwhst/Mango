@@ -147,11 +147,14 @@ TEST_CASE("terminal leaves use the exact result with the correct sign") {
   h2.reset(c.hash());
   SearchTree t2(testParams(30), n, 5);
   t2.newGame(c, h2);
+  const int positionsBefore = ev.positions();  // ev is shared with the first tree
   t2.runSequential(ev);
   REQUIRE(t2.checkInvariants() == "");
   for (const Edge& e : t2.root().edges)
     if (e.N > 0) CHECK(e.Q() == doctest::Approx(-1.0f));
-  CHECK(ev.positions() >= 1);  // only the roots were evaluated: every child is terminal
+  // Only the root was evaluated: every child is terminal, so no other position reaches the net.
+  CHECK(ev.positions() - positionsBefore == 1);
+  CHECK(t2.terminalSimulationsThisMove() == 30);  // all 30 simulations ended at a terminal child
 }
 
 TEST_CASE("PUCT prefers higher Q at equal N and higher prior at equal Q") {

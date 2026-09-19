@@ -16,6 +16,10 @@ class TorchEvaluator : public NNEvaluator {
   struct Options {
     std::string device = "auto";  // auto | cuda | mps | cpu
     bool fp16 = true;             // only honoured on CUDA
+    // CUDA fp32 only: let cuDNN/cuBLAS use TF32 tensor cores (10-bit mantissa) for fp32 convs
+    // and matmuls. LibTorch enables TF32 for cuDNN by default; we turn it off so "fp32"
+    // means IEEE fp32 and matches the PyTorch reference to 1e-4. Irrelevant under fp16.
+    bool allowTf32 = false;
   };
 
   TorchEvaluator(const std::string& modelDir, const Options& options);
