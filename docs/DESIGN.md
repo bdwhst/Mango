@@ -1,10 +1,10 @@
 # Mango: AlphaGo Zero Reproduction — Design Document
 
-Status: **v4 — contracts fixed after third review; implementation of M1–M3a approved and started**
-Date: 2026-09-17 (v1–v4)
+Status: **v5 — v4 contracts plus the single-GPU acceleration profile (§13, off by default) and MGO2 optional fields; M1–M3a done, M3a′ next**
+Date: 2026-09-17 (v1–v4), 2026-09-21 (v5)
 Target paper: Silver et al., *Mastering the game of Go without human knowledge*, Nature 550, 354–359 (2017) — "AlphaGo Zero" (AGZ).
 
-Change logs: §14 (v1 → v2), §15 (v2 → v3), §16 (v3 → v4).
+Change logs: §15 (v1 → v2), §16 (v2 → v3), §17 (v3 → v4), §18 (v4 → v5).
 
 ---
 
@@ -17,13 +17,16 @@ Change logs: §14 (v1 → v2), §15 (v2 → v3), §16 (v3 → v4).
 3. Board size is a **runtime** parameter of the engine (5 ≤ N ≤ 19). A trained model is nevertheless **size-specific** (both heads contain fully connected layers whose width depends on N²); the engine validates the model's declared size against the requested board size. The first milestone is a complete 9×9 loop; 19×19 is the same code with a different config and its own model.
 4. Every component is testable in isolation: rules, search, network export, data format.
 5. **Search correctness and evaluation validity are the primary risks** and get the most design and test attention (§§5.4, 5.5, 5.8, 9).
+6. **Single machine, single GPU, for both self-play inference and training.** The whole loop must run on one consumer GPU (RTX 5080 class, or an Apple Silicon GPU) with the phases sharing that device; there is no distributed or multi-GPU code path. Efficiency on that one device is a design goal, not an afterthought: batched inference across games, fp16 inference, an evaluation cache and mixed-precision training are part of the baseline, not deviations.
+7. **Measure, on that one GPU, how much of AGZ's compute the later literature removes.** A second profile (§13, `accel`) adds the self-play accelerations of KataGo (playout cap randomization, forced playouts with policy-target pruning, auxiliary ownership/score targets, global pooling) and two loop-level changes (no gating, growing window), **each behind a switch that is off by default**, so that the AGZ reproduction (goal 1) stays untouched and every switch is judged against it on the same frozen ladder at equal GPU-hours (M4b). The deliverable is the ablation report, not a stronger engine.
 
 ### Non-goals (for now)
 
-- Hand-written CUDA / Metal inference kernels. LibTorch is the inference backend; a custom backend can be added later behind the same C++ interface.
-- KataGo-style extensions (ownership head, score head, multiple rule sets, variable komi, analysis features).
-- Distributed self-play across machines. Single machine, single GPU.
-- Human game data (SL bootstrap) — that is AlphaGo 2016, not AGZ.
+- Hand-written CUDA / Metal inference kernels. LibTorch is the inference backend; a custom backend (CUDA Graphs, TensorRT) can be added later behind the same C++ interface if §10 shows launch overhead dominating.
+- KataGo as a product: multiple rule sets, variable komi and handicap, analysis features, the score-distribution head, score utility in search. Only the self-play accelerations listed in goal 7 are in scope, and only as switches.
+- Gumbel AlphaZero search and MuZero-style reanalyze. Both are promising for one GPU and are deliberately deferred until the M4b baseline exists (§13).
+- Distributed self-play across machines; multi-GPU training; running self-play and training **concurrently** on the one GPU (phases are sequential, §6.5 — reconsidered only for 19×19, §13).
+- Human game data (SL bootstrap) — that is AlphaGo 2016, not AGZ. Human games may serve as an evaluation set (move-prediction accuracy) but never as training data.
 - **Reproducing 19×19 strength.** The 19×19 configuration exists to prove the code path runs end to end; see §8.1 for the compute arithmetic.
 
 ---
@@ -222,14 +225,14 @@ public:
 **Contract (all implementations):**
 
 - `evaluate` is synchronous: outputs are complete on return, and the caller's `planes` memory is not referenced afterwards.
-- The exported model returns **logits and value**; the evaluator computes the **softmax in fp32** (logits are cast to fp32 first) so that fp16 execution cannot underflow small priors to exactly 0. Legal-move masking and renormalisation are done by the search, never by the evaluator, because legality depends on history the 17 planes do not contain.
+- The exported model returns **logits and value** as the first two entries of its output tuple (optional auxiliary heads follow and are ignored by the engine, §6.1); the evaluator computes the **softmax in fp32** (logits are cast to fp32 first) so that fp16 execution cannot underflow small priors to exactly 0. Legal-move masking and renormalisation are done by the search, never by the evaluator, because legality depends on history the 17 planes do not contain.
 - The evaluator is not required to be thread-safe; one evaluator is used from one thread.
 
 **`TorchEvaluator`**
 
 - Loads a **model version directory** (§6.4): `model.pt` (TorchScript) + `model.json` (`model_id`, board size, plane count, feature schema, residual-block and filter counts, export dtype, git hash, export time). Selects the device at runtime: `--device auto` → CUDA if `torch::cuda::is_available()`, else MPS if `torch::mps::is_available()`, else CPU.
 - Runs under `c10::InferenceMode`; the module is in eval mode as exported (BN uses running statistics). On CUDA the module is converted to fp16 by default and the input tensor is cast to the module's dtype; fp32 on MPS and CPU; `--fp32` forces fp32 everywhere for parity checks.
-- Input planes are copied into a host tensor `[B,17,N,N]` (uint8), moved to the device, converted to the model dtype; one forward call per batch returns `(logits [B,N²+1], value [B])`; logits are brought back as fp32 and soft-maxed on the CPU (a few µs per row).
+- Input planes are copied into a host tensor `[B,17,N,N]` (uint8), moved to the device, converted to the model dtype; one forward call per batch returns `(logits [B,N²+1], value [B], …)`; logits are brought back as fp32 and soft-maxed on the CPU (a few µs per row).
 - **TorchScript is deprecated upstream** but still shipped and loadable in the pinned PyTorch 2.14. We pin to it deliberately for the prototype. **Known risk (observed in M2):** PyTorch 2.14 emits `FutureWarning: torch.jit.trace is not supported in Python 3.14+ and may break` on the dev machine's Python 3.14 venv; tracing and loading currently work and the round-trip tests pass. If tracing breaks on a future PyTorch, the fallback is a Python 3.12 venv for the export step (the C++ loader does not depend on the Python version). `torch.export` / AOTInductor are *not* drop-in replacements for `torch::jit::load` and would require a different C++ loader; that is a separate future task. The exact deployment path (trace in eval mode → save → `torch::jit::load` → forward under InferenceMode on CUDA and on MPS) is verified by `test_torch_eval` on both platforms in **M2**.
 
 **`FakeEvaluator`**: deterministic policy (uniform, or a table keyed by position hash) and value; used by MCTS tests so search logic can be tested without a GPU.
@@ -359,6 +362,14 @@ Disabled in the first version (`resign_threshold = -1`). When enabled: per invar
 
 After a move is played the chosen child becomes the root, keeping its subtree and statistics. Root noise is re-applied to the new root's priors. The tree is **never shared between two different players/models** (§5.8). **GTP `undo`, `clear_board`, `boardsize` and `komi` discard the whole tree** (tree reuse only ever follows a forward move).
 
+#### 5.4.9 Acceleration hooks in the search (all off by default; §13)
+
+The three search-side techniques of the acceleration profile are specified here so that the search contract stays in one place. With every `accel` switch off, the search is exactly §5.4.1–§5.4.8.
+
+- **Playout cap randomization (PCR, KataGo).** Before each self-play move, with probability `full_prob` the move is a **full search**: budget `S` new simulations, root Dirichlet noise on, forced playouts on (if enabled), and the position becomes a **policy-target position** (`search_kind = 1`). Otherwise it is a **reduced search**: budget `reduced_simulations`, root noise **off**, forced playouts **off**, and — **as in the paper (KataGo 2019 §3.1)** — the position is **not a training sample** (`search_kind = 0`; the loader skips it). The gain comes from more games per GPU-hour, hence more independent game outcomes for the value head, not from training on the cheap positions. `accel.playout_cap.reduced_positions = "value_only"` is an **additional experimental variant** that keeps reduced positions as value/auxiliary samples with the policy term masked; it changes the objective's policy/value balance and is specified in §6.2 (normalisation) and §6.3 (sampling). The move is still chosen from the visit counts with the usual temperature rule (§5.4.6). Tree reuse applies to both kinds; `simulations_this_move` counts new simulations in both. The decision is drawn from the game's RNG stream so a game is reproducible from its seed. Match/GTP/ladder searches are always full searches.
+- **Forced playouts (KataGo).** At the root of a full search, child `a` with prior `P(a)` is selected regardless of its PUCT score while `N(a) < n_forced(a) = sqrt(k_forced · P(a) · Σ_b N(b))`, `k_forced = 2`. Ties among forced children follow the normal PUCT order. Never applied below the root, never in reduced searches, never in match play.
+- **Policy-target pruning (KataGo).** During a full search the root counts, per child, how many of its selections were forced (`F(c)`, an integer; no formula is re-evaluated afterwards). After the search, with `b` the most-visited child, all of `Q(·)` **frozen** at their end-of-search values (`W/N` before any removal; utilities are held constant as in KataGo 2019 §3.2) and the exploration term's total **frozen** at `N_tot = Σ_a N(a)` (pre-pruning): for every child `c ≠ b`, let `n = N(c)`; while `n > N(c) − F(c)` and `Q(c) + c_puct · P(c) · sqrt(N_tot) / (1 + (n − 1)) ≤ Q(b) + c_puct · P(b) · sqrt(N_tot) / (1 + N(b))`, decrement `n` — i.e. remove forced visits one at a time as long as the child, with one fewer visit, would still not have out-scored `b`. The target count is `n`; a child ending with `n ≤ 1` is dropped from the target (count 0), except the played move, which keeps `max(n, 1)`. `b` is never pruned. **Only the stored target is pruned**: the tree, `root_total_visits`, `root_value` and `root_max_q` are untouched, and move selection has already happened. In the chunk this shows as `Σ count ≤ root_total_visits` (§5.6, `record_extras` bit 2).
+
 ### 5.5 Self-play driver (`cpp/selfplay`)
 
 First version, deliberately simple (**one evaluator, one thread, G games, K = 1**):
@@ -405,7 +416,11 @@ Stored **per game, not per position**: position snapshots + moves + sparse root 
 | 88 | 8 | u64 | run_seed |
 | 96 | 2 | u16 | move_cap |
 | 98 | 2 | u16 | temperature_moves (needed by the loader for `store_pi = "temperature"`) |
-| 100 | 28 | u8[28] | reserved (zero) |
+| 100 | 1 | u8 | record_extras bitmask: bit 0 = every game record ends with `final_ownership`; bit 1 = every game record carries per-move `search_kind`; bit 2 = stored visit counts are policy-target-pruned (§5.4.9). Zero under the AGZ profile |
+| 101 | 1 | u8 | reserved (zero) |
+| 102 | 2 | u16 | reduced_simulations (PCR reduced budget; 0 = PCR off) |
+| 104 | 4 | f32 | full_search_prob (PCR; 1.0 when PCR off) |
+| 108 | 20 | u8[20] | reserved (zero) |
 
 **Game record** (repeated `num_games` times, immediately after the header, no alignment):
 
@@ -421,12 +436,14 @@ Stored **per game, not per position**: position snapshots + moves + sparse root 
 | 12 | 8 | u64 | game_seed |
 | 20 | (T+1)·P | u8 | snapshots, P = ceil(N²/4) bytes each, 2 bits/point (0 empty, 1 black, 2 white), point index = row·N + col, little-endian within a byte (point 4k in bits 0–1). Snapshot t is the configuration **before** move t; snapshot T is final |
 | — | T·2 | u16 | moves: point index 0..N²−1, N² = pass |
+| — | T·1 | u8 | **only if record_extras bit 1**: `search_kind` per move: 1 = full search (policy-target position), 0 = reduced search (value/aux targets only) (§5.4.9) |
 | — | T·8 | f32, f32 | per move: `root_value` v(s₀), `root_max_q` (both in the mover's perspective; §5.4.7) |
-| — | variable | | per move: `u32 root_total_visits; u16 nnz; nnz × (u16 action, u32 count)` — root visit counts including inherited visits; Σ count == root_total_visits |
+| — | variable | | per move: `u32 root_total_visits; u16 nnz; nnz × (u16 action, u32 count)` — root visit counts including inherited visits; Σ count == root_total_visits, except with record_extras bit 2 where the counts are pruned and Σ count ≤ root_total_visits (nnz ≥ 1: the played move is always present) |
+| — | N²·1 | i8 | **only if record_extras bit 0**: `final_ownership` of the final snapshot per point, +1 black area, −1 white area, 0 neutral — the engine's `areaOwnership` (§5.1), stored so that Python never needs the rules engine |
 
-Derived by the loader, never stored: planes for position `t` come from snapshots `t, t−1, …, t−7` (zeros before 0) split into mover/opponent by parity (**black moves at even t**: no handicap, and passes alternate turns); `z_t = result · (+1 if t even else −1)`; `π_t` from the visit counts with the chosen `store_pi` rule (§5.4.6).
+Derived by the loader, never stored: `ownership_t = final_ownership · (+1 if t even else −1)` and `score_t = score · (+1 if t even else −1)` (mover's perspective, like `z_t`), with an **auxiliary mask `aux_t = 0` for resigned games** (`termination = 1`: the final snapshot is unfinished and its area score need not favour the winner; two-pass and move-cap games are complete positions and keep `aux_t = 1`); `final_ownership` is still written for resigned games so the file stays uniform and the resignation diagnostics can use it. Positions with `search_kind = 0` are not training samples unless `reduced_positions = "value_only"` (§5.4.9). Planes for position `t` come from snapshots `t, t−1, …, t−7` (zeros before 0) split into mover/opponent by parity (**black moves at even t**: no handicap, and passes alternate turns); `z_t = result · (+1 if t even else −1)`; `π_t` from the visit counts with the chosen `store_pi` rule (§5.4.6).
 
-**Cross-language fixture.** `tests/fixtures/mgo2_fixture.bin` is a hand-constructed chunk with two short 5×5 games and known byte content; both the C++ reader and `chunk.py` must parse it to the same values, and both writers must reproduce it byte for byte from the same in-memory games.
+**Cross-language fixture.** `tests/fixtures/mgo2_fixture.bin` is a hand-constructed chunk with two short 5×5 games and known byte content (record_extras = 0), and `mgo2_fixture_extras.bin` the same games with all three extras bits set; both the C++ reader and `chunk.py` must parse it to the same values, and both writers must reproduce it byte for byte from the same in-memory games.
 
 **Size** per position: 9×9 ≈ 21 B snapshot + 2 B move + 8 B root values + 6 B + 6·nnz B (nnz typically 20–40) ≈ 200 B; 19×19 ≈ 91 B + 2 B + 8 B + 6 B + 6·nnz (nnz ≤ ~100) ≈ 700 B.
 
@@ -473,11 +490,17 @@ Self-play, training and evaluation run **sequentially** in the first version (§
 
 ### 6.1 Model (`model.py`)
 
-`AGZNet(board_size, res_blocks, filters, planes=17)` exactly as in §2: initial convolutional block **plus** `res_blocks` residual blocks (config counts residual blocks only), policy head, value head. Forward returns `(logits, v)` in both training and export; softmax is the evaluator's job (§5.3).
+`AGZNet(board_size, res_blocks, filters, planes=17)` exactly as in §2: initial convolutional block **plus** `res_blocks` residual blocks (config counts residual blocks only), policy head, value head.
+
+Optional parts, present only when the corresponding `accel` switch is on (§13); the exported `model.json` lists them under `heads` and `trunk` so the C++ evaluator can check what it loads:
+- **Global pooling** (`accel.global_pooling`): in the residual blocks listed in `global_pooling_blocks`, half of the channels after the first conv go through a pooling branch — per channel the mean, the mean scaled by `(N − 14)/10` (KataGo's board-size feature; constant on one board size but kept so the module is size-agnostic) and the max — followed by a linear layer whose output is added as a per-channel bias to the other half before the second conv. The 1×1 policy and value convs are unchanged.
+- **Ownership head** (`accel.aux.ownership`): 1×1 conv (1 filter) → tanh, one value per point, target `ownership_t` (§5.6).
+- **Score head** (`accel.aux.score`): from the value head's 256-unit layer a second linear output, `ŝ`, predicting `score_t / N²` (a scalar; KataGo's score-distribution head is deliberately not reproduced).
+**Output contract (training, export and C++ alike).** `forward` returns a **positional tuple**: `(logits [B,N²+1], value [B])`, followed — only when the corresponding head exists — by `ownership [B,N²]` and then `score [B]`, in that fixed order. There is no dict output and no lookup by name. `model.json` lists `outputs` (e.g. `["policy_logits", "value"]` or `["policy_logits", "value", "ownership", "score"]`) and `trunk.global_pooling_blocks`; `export.py` traces the full tuple; the C++ evaluator checks that the tuple length equals `len(outputs)` and that entries 0 and 1 are named `policy_logits` and `value`, uses those two, and ignores the rest. `train.py` unpacks the same positions. Softmax is the evaluator's job (§5.3).
 
 ### 6.2 Loss, optimiser and how much to train per iteration (`train.py`)
 
-- `loss = mse(v, z) + cross_entropy(logits, π) + c · Σ‖θ‖²` with `c = 1e-4` as an explicit term over conv and linear **weights** (BN affine parameters and biases excluded — deviation D9). Implementation note: the gradient of `c‖θ‖²` is `2cθ`; if this is ever replaced by `SGD(weight_decay=…)` the equivalent value is `2e-4`, not `1e-4`.
+- `loss = mse(v, z) + CE_policy + w_own · L_own + w_score · L_score + c · Σ‖θ‖²`. Per batch: `CE_policy` is the cross-entropy **averaged over the positions with `search_kind = 1`** (under the AGZ profile and under PCR with `reduced_positions = "drop"` that is every position, so the term is the paper's; with `"value_only"` it is the mean over the policy-target positions present, or 0 if none — the policy gradient per policy-target position is then unchanged, only the value head sees more samples); `L_own = mean over positions with aux_t = 1 of mean_points(ô − ownership_t)²` and `L_score = mean over positions with aux_t = 1 of (ŝ − score_t/N²)²`, both 0 when no such position is in the batch (`aux_t` masks resigned games, §5.6). The auxiliary terms exist only with their heads (`w_own = 1.0`, `w_score = 0.5` initial values, swept in M4b); `c = 1e-4` as an explicit term over conv and linear **weights** (BN affine parameters and biases excluded — deviation D9). Implementation note: the gradient of `c‖θ‖²` is `2cθ`; if this is ever replaced by `SGD(weight_decay=…)` the equivalent value is `2e-4`, not `1e-4`.
 - SGD, momentum 0.9, LR schedule by global step from the config (9×9 default: 0.01 for 0–30k, 0.001 for 30k–60k, 0.0001 after). Batch 256.
 - **Steps per iteration are bounded by the data.** `steps = min(train_steps, ceil(samples_per_position × window_positions / batch))` with `samples_per_position = 0.25` per iteration by default. On iteration 1 (≈ 2,000 games ≈ 140k positions) that is ≈ 140 steps rather than 1,000, so early networks never see the tiny first window for multiple epochs; at steady state (window 20k games ≈ 1.4M positions) the cap is inactive and each position is sampled ≈ 0.25 × 10 iterations ≈ 2.5 times over its lifetime. The paper's value head over-fitting on consecutive positions of the same game (noted in AlphaGo 2016) is the reason for this cap and for the held-out monitor (§6.6).
 - Mixed precision (`torch.autocast` + `GradScaler`) on CUDA; fp32 on MPS.
@@ -486,14 +509,14 @@ Self-play, training and evaluation run **sequentially** in the first version (§
 ### 6.3 Data pipeline (`data.py`, `chunk.py`)
 
 - The **replay manifest** (`replay/manifest.json`) lists chunk files in creation order with `chunk_id`, `model_id`, game count and position count. The window is the most recent `window_games` games by this manifest (9×9 default 20,000).
-- `ChunkDataset` **memory-maps** each chunk in the window (`np.memmap`, read-only) and builds a small index of (game offset, T, holdout flag) once; the OS page cache is then shared by all readers, so a 19×19 window of ~17 GB is never duplicated per process. Sampling is uniform over **training positions** (holdout games excluded): pick a game with probability ∝ T, then t uniform in [0, T). For the sampled (game, t) it unpacks snapshots t…t−7, builds the 17 planes and `z_t`, builds `π_t` from the visit counts, applies one of the 8 symmetries to planes and to the board part of π (pass untouched), and yields `(planes float32, π, z)`. The first version runs with `num_workers = 0` (assembly is cheap NumPy indexing); workers are added only if the GPU is measurably starved, and then they share the maps rather than copy them.
+- `ChunkDataset` **memory-maps** each chunk in the window (`np.memmap`, read-only) and builds a small index of (game offset, T, holdout flag) once; the OS page cache is then shared by all readers, so a 19×19 window of ~17 GB is never duplicated per process. Sampling is uniform over **training positions** (holdout games excluded): pick a game with probability ∝ T, then t uniform in [0, T). For the sampled (game, t) it unpacks snapshots t…t−7, builds the 17 planes and `z_t`, builds `π_t` from the visit counts, and — when the heads exist — `ownership_t`, `score_t` and `aux_t`; then applies **one and the same** of the 8 symmetries to the planes, to the board part of π (pass untouched) **and to the ownership map** (the score, `z` and the masks are invariant), and yields `(planes float32, π, z[, ownership, score, aux_mask])`. Under PCR the index excludes positions with `search_kind = 0` (`reduced_positions = "drop"`, the paper), or includes them with a `policy_mask` (`"value_only"`); a game's sampling weight is its number of **indexed** positions, so sampling stays uniform over training positions either way. The first version runs with `num_workers = 0` (assembly is cheap NumPy indexing); workers are added only if the GPU is measurably starved, and then they share the maps rather than copy them.
 - `HoldoutDataset` iterates every position of the holdout games once (no symmetry), for the monitor in §6.6.
 - **Windows file locking.** Chunks are only ever deleted by the pipeline process, between phases, when no trainer process is alive (§6.5). The trainer never deletes; DataLoader workers are torn down at the end of the training phase. Eviction of chunks that fall out of the window happens at the start of the next self-play phase.
 - Symmetry index tables are precomputed per board size and shared with the C++ `applySymmetry` via a fixture test.
 
 ### 6.4 Export and model versions (`export.py`, `docs/MODEL_FORMAT.md`)
 
-- `model.eval()` is required before tracing; export runs `torch.jit.trace` on CPU, fp32, input `[B,17,N,N]` float32, **traced at batch 8** and checked at batch 1 and 64 (tracing at batch 1 risks specialising the batch dimension into view/reshape ops). The exported graph returns `(logits, value)`.
+- `model.eval()` is required before tracing; export runs `torch.jit.trace` on CPU, fp32, input `[B,17,N,N]` float32, **traced at batch 8** and checked at batch 1 and 64 (tracing at batch 1 risks specialising the batch dimension into view/reshape ops). The exported graph returns the positional tuple of §6.1 (`(logits, value)` under the AGZ profile).
 - **Metadata carries the game contract.** `model.json` contains, besides the fields in §5.3: `komi`, `rules_id`, `move_cap`, `feature_schema`, `board_size`. The model has no komi input, so its value head is only meaningful for the komi and rules it was trained under. The engine refuses to run a model whose `board_size`, `feature_schema` or `rules_id` differ from the run config, and refuses (or warns with `--allow-komi-mismatch`) when `komi` differs; the trainer refuses chunks whose komi/rules differ from the learner's. GTP `komi` accepts only the model's komi and answers `? unsupported komi <x>; this model was trained with <k>` otherwise. If a run is configured with an integer komi, draws are possible: `result = 0` and `z = 0` for every position of a drawn game.
 - A **model version** is an immutable directory `models/<model_id>/` with `model.pt`, `model.json` and `weights.pt` (eager state dict for the ladder / re-export). `model_id = <iteration:04d>-<8 hex of sha256 over the parameter bytes>` (the digest is over the state dict, not over `model.pt`, whose zip serialisation is not guaranteed byte-stable; ≤ 31 chars, fits the zero-padded `char[32]` header field). Directories are written to `models/.tmp-<id>-<pid>` and renamed into place; re-exporting identical weights is a no-op.
 - `best.json` holds the current best `model_id`; it is updated last, after the version directory exists.
@@ -603,6 +626,23 @@ Single JSON per run, sections `board`, `search`, `selfplay`, `training`, `eval`.
 | G games in flight × K leaves | 16 × 1 | 128 × 1 | 64 × 1 | — |
 | NN cache | off | off | off | (not described) |
 
+**`accel` section (§13), every switch off by default so that the defaults above are the AGZ profile:**
+
+| Key | Default | Meaning |
+|---|---|---|
+| `accel.playout_cap.enabled` | false | PCR (§5.4.9) |
+| `accel.playout_cap.full_prob` | 0.25 | probability of a full search per move |
+| `accel.playout_cap.reduced_simulations` | 9×9: 50, 19×19: 100 | reduced budget; the full budget is `search.simulations` |
+| `accel.playout_cap.reduced_positions` | "drop" | "drop" = reduced-search positions are not training samples (paper); "value_only" = experimental variant (§5.4.9, §6.2, §6.3) |
+| `accel.forced_playouts` | false | root forced playouts, `k_forced = 2` |
+| `accel.policy_target_pruning` | false | prune forced visits from the stored target (requires `forced_playouts`) |
+| `accel.aux.ownership` / `accel.aux.score` | false / false | auxiliary heads and targets (§6.1, §6.2); `w_own = 1.0`, `w_score = 0.5` |
+| `accel.global_pooling` / `global_pooling_blocks` | false / 9×9: [2, 4], 19×19: [5, 10, 15] | pooling branch in the listed residual blocks (1-based) |
+| `accel.gating` | true | false = AlphaZero-style: the candidate is always promoted, the evaluation match is skipped (the ladder still measures strength, §6.6) |
+| `accel.window` | "fixed" | "growing": window in games `= w₀ · (1 + β · ((n/w₀)^α − 1)/α)`, KataGo's schedule with `w₀ = 2,000` (9×9), `α = 0.75`, `β = 0.4`, `n` = games generated so far, capped at `training.window_games` |
+
+The chunk header records the PCR parameters and which extras are present (§5.6); the trainer refuses to mix chunks whose `record_extras` differ from the run's profile.
+
 ### 8.1 Compute arithmetic for 19×19 (why it is a "runs end to end" config)
 
 Per iteration: 5,000 games × ~250 positions × 800 simulations = **10⁹ network evaluations**. A 20×128 network on one RTX 5080 will plausibly reach 5–10k evaluations/s end to end (to be measured), i.e. **30–55 hours per iteration**, and a meaningful 19×19 run needs hundreds of iterations. The 19×19 config therefore proves that the code path (formats, memory, pipeline) works at full size; it is **not** expected to produce a strong player on this hardware, and M6's acceptance is phrased accordingly (§11). Reaching real 19×19 strength would need a much faster backend, more GPUs, and/or a reduced budget (fewer sims, smaller net), which is out of scope.
@@ -629,6 +669,7 @@ Once the 9×9 loop runs, sweep jointly: `c_puct ∈ {0.8, 1.1, 1.5, 2.5}` × FPU
 | Training (Python) | One-step overfit decreases loss; symmetry augmentation keeps π normalised; step cap (§6.2) computed correctly for small windows; LR schedule boundaries; learner checkpoint restore reproduces the next step bit-for-bit on CPU; holdout games never appear in training samples. |
 | Match | Unique-trajectory count is reported (diagnostic, no threshold); pair scores computed correctly on a fixture with a decisive pair, a split pair and a double loss; bootstrap interval reproducible under a fixed seed; promotion rule is the point estimate. Ladder: opening file generated once and reused; Bradley–Terry MAP fit on a fixture with a fully separated player returns finite ratings and flags the separation; a disconnected fixture is reported unrated. |
 | End-to-end | `pipeline.py --smoke` (5×5 config): finishes in < 2 minutes on CPU; runs on both platforms. |
+| Acceleration profile (§13, each behind its switch) | PCR: with a seeded game the sequence of full/reduced decisions is reproducible, reduced searches run `reduced_simulations` new simulations with no root noise and `search_kind = 0` is written; the loader excludes exactly those positions (`"drop"`) or masks their policy term (`"value_only"`). Forced playouts: with a `FakeEvaluator` whose prior gives one child `P = 0.5`, that child has at least `floor(sqrt(2 · 0.5 · N))` visits after `N` simulations even when its Q is −1. Pruning: a fixture root with known N/P/Q prunes to the hand-computed counts, the played move survives, tree statistics are untouched, `Σ count ≤ root_total_visits`. Ownership: `final_ownership` in the chunk equals `areaOwnership` of the final snapshot (C++ writer vs `RefBoard`); the loader's `ownership_t` sign follows `z_t`'s parity rule; **augmentation**: an asymmetric fixture position (distinct ownership at all 8 images) is checked under every symmetry — the transformed ownership map equals `areaOwnership` of the transformed board, and planes/π/ownership were transformed by the same index table; resigned games yield `aux_t = 0` and contribute nothing to `L_own`/`L_score` (loss unchanged when their targets are randomised). Pruning uses frozen Q: a fixture where `W/N` recomputation would change the outcome prunes to the hand-computed counts only under the frozen rule. PCR `"drop"`: reduced positions are absent from the dataset index and game weights equal indexed counts. Output tuple: a model with all heads exports 4 outputs, `model.json.outputs` matches, and the C++ evaluator loads it with unchanged policy/value parity while rejecting a model whose first two outputs are not `policy_logits`/`value`. Global pooling: the module is equivariant under the 8 symmetries (numerically, on random input), and a model with the extra heads exports and loads in C++ with unchanged policy/value parity. `accel.gating = false`: pipeline promotes without a match and `state.json` records it as such. Growing window: the formula is checked at `n = w₀` and `n = 10·w₀` against hand-computed values. |
 
 ---
 
@@ -653,10 +694,11 @@ Only after these numbers exist do we decide among: K > 1 (§5.4.5), multiple thr
 | M1 | **Done 2026-09-18 (Windows).** `cpp/core`: `Board` with snapshots, `GameHistory`, rules, features, symmetry, SGF, Zobrist, `RefBoard`; `mango_gtp` playing random legal moves; C++ tests | rules/history/feature/symmetry tests pass; differential fuzz (5/7/9 full, 13/19 sampled; `MANGO_FUZZ_SCALE` multiplies) passes at 5×; scripted GTP session verified (GoGui not yet tried) |
 | M2 | **Done 2026-09-18 on Windows; MPS pending.** `model.py`, `export.py` (logits out, batch-8 trace), model versions; `TorchEvaluator` with fp32 softmax; fixture `cpp/tests/fixtures/model_5x5_v1` + `python/tests/make_fixture.py` | CPU fp32, CUDA fp32 and CUDA fp16 match the PyTorch reference; the MPS case is compiled and **skipped until run on the Mac** |
 | M3a | **Done 2026-09-18.** Sequential search: K = 1, cache off, resignation off, symmetry off; collect/commit protocol implemented (K > 1 untested); `MctsPlayer` for GTP; fake-evaluator tests: first selection, backup signs, terminal (two-pass and cap), PUCT ordering, 3-ply ladder convergence, tree reuse and visit accounting, resignation perspective, superko along the path, invariants after every simulation | all sequential search tests pass |
-| **M3a′** | **5×5 sequential end-to-end learning check**: chunk writer (MGO2), `chunk.py`, minimal `train.py`/`export.py`/loop with the sequential engine, K = 1, no batching, no throughput work; a few dozen iterations on `5x5-smoke.json` | the loop-level contracts are exercised (z parity, π symmetry, snapshot assembly, holdout) and learning is shown two ways: (1) the value head on a fixed set of **known-outcome 5×5 positions** (near-terminal positions with an unambiguous area score) has the correct sign on ≥ 95% of them; (2) the final model beats the **frozen initial model** in a colour-swapped match on the fixed opening set with a bootstrap interval excluding 0.5. Held-out losses are recorded. |
+| **M3a′** | **5×5 sequential end-to-end learning check**: chunk writer/reader (MGO2 including the optional `record_extras` fields and both fixtures, §5.6; the accel features themselves stay off), `chunk.py`, minimal `train.py`/`export.py`/loop with the sequential engine, K = 1, no batching, no throughput work; a few dozen iterations on `5x5-smoke.json` | the loop-level contracts are exercised (z parity, π symmetry, snapshot assembly, holdout) and learning is shown two ways: (1) the value head on a fixed set of **known-outcome 5×5 positions** (near-terminal positions with an unambiguous area score) has the correct sign on ≥ 95% of them; (2) the final model beats the **frozen initial model** in a colour-swapped match on the fixed opening set with a bootstrap interval excluding 0.5. Held-out losses are recorded. |
 | M3b | Multi-game batching (K = 1 across G games), pending protocol, atomic chunk publish, SGF, seeds; `mango_match` with opening set + pair statistics; **throughput measurement** (§10) | batched == sequential when collision-free; chunks validated by Python; numbers reported |
 | M3c | (only if M3b numbers require it) K > 1 within a game, search-time symmetry on, resignation with auto threshold | batched protocol tests pass with collisions > 0 |
 | M4 | Full `train.py` (step cap, AMP, learner ckpt), `data.py`, `pipeline.py`, `strength.py`, held-out monitor; first 9×9 run; sweep §8.2 | Elo on the frozen ladder rises over ≥ 10 iterations with non-overlapping intervals; held-out curves logged |
+| **M4b** | **Single-GPU acceleration ablation on 9×9 (§13)**: implement the `accel` switches (§5.4.9, §6.1, §6.2, §8); runs R0 (AGZ profile, the M4 run) and R1–R5 each enabling one technique in the order PCR, aux heads, forced playouts + pruning, global pooling, gating off; R6 all on; equal GPU-hour budget per run, same seeds, same frozen ladder and opening set | a report `docs/ABLATION_9x9.md` with ladder Elo (with intervals) at equal GPU-hours and at equal games for every run, self-play throughput per run, and held-out curves; every deviation listed in §12 D11–D16 is either shown to help on one GPU or recorded as not helping — no acceptance threshold on the direction of the result |
 | M5 | Full macOS run of the smoke pipeline by the user | `pipeline.py --smoke` passes on the Mac |
 | M6 | 19×19 **runs end to end**; performance work; README | `configs/19x19-smoke.json` (20 games, 50 train steps, 4 eval pairs per iteration, full-size 20×128 network) completes ≥ 2 iterations without format/memory failure; throughput of the full `19x19.json` budget measured on a handful of games and documented against §8.1; **no strength claim** |
 
@@ -676,10 +718,42 @@ Only after these numbers exist do we decide among: K > 1 (§5.4.5), multiple thr
 | D8 | Rules named "Tromp–Taylor scoring with suicide prohibited"; original Tromp–Taylor permits suicide | Matches common AGZ reimplementations. |
 | D9 | L2 regularisation applied to conv/linear weights only; paper regularises all parameters (c‖θ‖²) | Standard practice (BN affine and biases excluded); a config flag `l2_all_params` restores the paper's form. |
 | D10 | Training steps per iteration capped by window size (0.25 samples per position per iteration); 5% of games held out | Prevents multi-epoch training on the tiny early windows; the paper's window was never small. |
+| D11 | Playout cap randomization (§5.4.9) | `accel.playout_cap.enabled`, **off**. KataGo 2019 §3.1: reduced-search positions are not recorded; the value head gains from more games per GPU-hour. `reduced_positions = "value_only"` is a further, separately flagged experiment. |
+| D12 | Forced playouts and policy-target pruning (§5.4.9) | `accel.forced_playouts`, `accel.policy_target_pruning`, **off**. KataGo 2019 §3.2. |
+| D13 | Auxiliary ownership and score heads/targets (§6.1, §6.2) | `accel.aux.*`, **off**. KataGo 2019 §3.3; the score head is a scalar simplification. |
+| D14 | Global pooling in the trunk (§6.1) | `accel.global_pooling`, **off**. KataGo 2019 §3.4. |
+| D15 | No gating: always promote (AlphaZero) | `accel.gating = false`, default **true** (AGZ). |
+| D16 | Growing training window (§8) | `accel.window = "growing"`, default `"fixed"` (AGZ used a fixed 500k-game window). |
 
 ---
 
-## 13. Decisions taken on the v1 open questions
+## 13. Single-GPU acceleration profile (`accel`)
+
+**Why a profile and not a redesign.** The project's first deliverable is a faithful AGZ reproduction (§1); its second is to find out how much of AGZ's compute the later literature lets one GPU do without. Both need the same infrastructure. Every technique below is therefore a **config switch, off by default**, so that `9x9.json` unchanged is the AGZ profile (§8), and M4b measures each switch against that baseline on the same frozen ladder (§6.6) at equal GPU-hours. Nothing here changes the M1–M4 contracts except the optional chunk fields (§5.6), which are added now so that the format never needs a version bump for M4b.
+
+**Systems-level work is not a deviation** and is not gated by a switch: multi-game batching (M3b), the NN cache (D6), fp16 inference (done), AMP/`channels_last`/`torch.compile` in training (M4), and later a CUDA-Graphs or TensorRT backend if §10 shows launch overhead dominating on the small 9×9 network.
+
+| Technique | Source | Expected effect on one GPU | Where specified |
+|---|---|---|---|
+| Playout cap randomization | Wu, *Accelerating Self-Play Learning in Go* (2019), §3.1 | Largest single gain in KataGo's ablation: ~3–4× more games per GPU-hour, so the value head sees many more independent outcomes while policy targets keep the full search depth | §5.4.9, §5.6, D11 |
+| Auxiliary ownership + score targets | KataGo 2019 §3.3 | Large sample-efficiency gain, mostly on the value head; costs N²+4 bytes per game | §6.1, §6.2, §5.6, D13 |
+| Forced playouts + policy-target pruning | KataGo 2019 §3.2 | Modest; makes root exploration honest and keeps the Dirichlet noise out of π | §5.4.9, D12 |
+| Global pooling | KataGo 2019 §3.4 | Small on 9×9, expected larger on 19×19 (komi/global-count awareness) | §6.1, D14 |
+| No gating | Silver et al., AlphaZero (2017/2018); KataGo | Saves the evaluation matches (~20 % of an iteration at 9×9 defaults) at the risk of promoting a regression | §6.5, D15 |
+| Growing window | KataGo 2019 §4 | Small windows early (fast forgetting of random play), large later | §8, D16 |
+
+**Ablation protocol (M4b).** Runs `R0` (all off, = the M4 run), `R1` PCR, `R2` R1 + aux heads, `R3` R2 + forced playouts and pruning, `R4` R3 + global pooling, `R5` R4 + gating off, `R6` R5 + growing window. Cumulative rather than one-at-a-time, because the KataGo ablation showed the techniques interact (PCR without the aux targets weakens the value head). Every run: the same `run_seed`, the same GPU-hour budget (measured, not games), the same frozen ladder, opening file and anchors. Reported per run: ladder Elo with intervals against GPU-hours **and** against games, self-play positions/s, held-out losses, average game length, resignation false-positive rate. The report is descriptive: a technique that does not help on 9×9 at this scale stays in the code, off, with the number that says so.
+
+**Deferred (listed so they are not re-litigated):**
+- *Gumbel AlphaZero* (Danihelka et al., 2022: Gumbel-Top-k root sampling with sequential halving, policy-improvement guarantee at 16–32 simulations). Largest potential gain but replaces root selection and the policy target; candidate for a later profile once M4b exists as its baseline.
+- *Reanalyze* (Schrittwieser et al., MuZero, 2020): re-search stored positions with the current network to refresh π; inference-only compute. After M4b.
+- *Concurrent self-play and training on one GPU* (KataGo's asynchronous loop). At 9×9 defaults training is ≈ 10 % of an iteration, so the upper bound on the gain is that 10 %, against a rewrite of the restart protocol (§6.5). Reconsider for 19×19 where the training share grows.
+- *TensorRT / CUDA Graphs backend*, *K > 1 per game*: performance work, decided by §10 numbers (M3c, M6).
+- *Score utility in MCTS, multiple rule sets, variable komi, handicap*: KataGo features outside the reproduction's scope (§1).
+
+---
+
+## 14. Decisions taken on the v1 open questions
 
 | Q | Decision |
 |---|---|
@@ -693,7 +767,7 @@ Only after these numbers exist do we decide among: K > 1 (§5.4.5), multiple thr
 
 ---
 
-## 14. Change log v1 → v2 (response to the first review)
+## 15. Change log v1 → v2 (response to the first review)
 
 | Review point | Change |
 |---|---|
@@ -708,7 +782,7 @@ Only after these numbers exist do we decide among: K > 1 (§5.4.5), multiple thr
 | Paper-faithfulness corrections | Q = 0 init; 722-move cap; automatic resign threshold; temperature-adjusted stored π (D4); search-time symmetry; block counting convention; 64 GPU workers. |
 | Rules naming, runtime size vs model, union-find liberties | "TT scoring with suicide prohibited"; passes exempt from superko; size-specific models; exact liberty bitsets. |
 
-## 15. Change log v2 → v3 (response to the second review)
+## 16. Change log v2 → v3 (response to the second review)
 
 | # | Review point | Change |
 |---|---|---|
@@ -726,7 +800,7 @@ Only after these numbers exist do we decide among: K > 1 (§5.4.5), multiple thr
 | 12 | c_puct = 1.5 with Q = 0 FPU | §5.4.3 describes the asymmetry; §8.2 defines the M4 sweep; D2 reworded. |
 | — | Small items | `model_id` zero-padded/truncated (§5.6, §6.4, test); GTP `undo`/`clear_board`/`boardsize`/`komi` discard the tree (§5.4.8, §5.7); self-play `run_seed` in the chunk header and per-game `game_seed` in the game record and SGF (§5.5, §5.6). |
 
-## 16. Change log v3 → v4 (response to the third review)
+## 17. Change log v3 → v4 (response to the third review)
 
 | # | Review point | Change |
 |---|---|---|
@@ -739,3 +813,15 @@ Only after these numbers exist do we decide among: K > 1 (§5.4.5), multiple thr
 | 7 | Komi vs model input | §6.4: `komi`, `rules_id`, `move_cap`, `feature_schema` in `model.json`; engine/trainer validate consistency; GTP `komi` rejects unsupported values; draws defined (`result = 0`, `z = 0`) for integer komi. |
 | 8 | Three over-strong tests | §9: symmetry test = coordinate mapping with a known-function `FakeEvaluator`, no equivariance assumption; unique-trajectory ratio is a diagnostic; M3a′ acceptance = value sign on known-outcome positions + colour-swapped match vs the frozen initial model with a bootstrap interval. |
 | — | Minor | §5.4.2 "×2" marked as an estimate, peak node count measured; §6.3 mmap + `num_workers = 0` first; §6.6 holdout rise is an alarm, not a verdict; §11/§4 `19x19-smoke.json` for M6; §5.1.1 replay-vs-snapshot wording corrected. |
+
+## 18. Change log v4 → v5 (single-GPU acceleration profile)
+
+| # | Topic | Change |
+|---|---|---|
+| 1 | Acceleration profile | New §13: motivation, technique table with sources, M4b ablation protocol, deferred list. All switches off by default; `9x9.json` unchanged is the AGZ profile. |
+| 2 | Search hooks | §5.4.9: playout cap randomization, forced playouts, policy-target pruning specified against the §5.4 contract (only the stored target is pruned; tree and `root_total_visits` untouched). |
+| 3 | MGO2 optional fields | §5.6: header `record_extras` bitmask (offset 100), `reduced_simulations` (102), `full_search_prob` (104); per-move `search_kind` after the moves array; per-game `final_ownership` at the end of the record; `Σ count ≤ root_total_visits` when pruned; second fixture with all extras present. Implemented in M3a′ so the format never needs a version bump. |
+| 4 | Model and loss | §6.1: optional global pooling, ownership head, scalar score head, listed in `model.json`; §6.2: masked policy loss and auxiliary terms. |
+| 5 | Config, tests, milestones, deviations | §8 `accel` section; §9 test row; §11 M4b; §12 D11–D16. Sections 13–16 renumbered to 14–17. |
+| 6 | Goals | §1: goals 6 (single GPU for inference and training, efficiency as a baseline property) and 7 (measure what the later literature removes, via switches); non-goals reworded: KataGo-as-product, Gumbel/reanalyze, concurrency on the one GPU, human data only as an evaluation set. |
+| 7 | v5 review (5 points) | (1) §6.3: the same symmetry is applied to planes, π and the ownership map; asymmetric 8-fold fixture in §9. (2) §5.6/§6.2: `aux_t = 0` for resigned games, auxiliary losses averaged over unmasked positions only. (3) §6.1/§5.3/§6.4: positional output tuple `(logits, value[, ownership[, score]])`, `model.json.outputs`, C++ checks length and the first two names. (4) §5.4.9/§6.2/§6.3/§8: PCR follows the paper — reduced-search positions are not training samples (`reduced_positions = "drop"`); `"value_only"` kept as a separately flagged experiment with CE averaged over policy-target positions. (5) §5.4.9: pruning uses per-child integer forced counts `F(c)`, frozen `Q`, frozen `N_tot`, an explicit decrement loop and the played-move floor. |
