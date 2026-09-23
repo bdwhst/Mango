@@ -39,6 +39,49 @@ FakeEvaluator colorValueEvaluator(int n, float valueForBlack) {
 
 Move pt(int r, int c, int n) { return static_cast<Move>(pointOf(r, c, n)); }
 
+bool occupied(const uint8_t* planes, int n, int p) { return planes[p] == 1 || planes[8 * n * n + p] == 1; }
+bool anyStone(const uint8_t* planes, int n) {
+  for (int p = 0; p < n * n; ++p)
+    if (occupied(planes, n, p)) return true;
+  return false;
+}
+
+// Evaluator that steers a normal search along `line`: at any position the first line
+// point that is still empty gets an overwhelming prior (pass entries in `line` mean
+// "prefer pass once everything before it is on the board"). Value 0 everywhere, so
+// only priors decide; with FPU Q = 0 the search then descends the line one ply per
+// simulation through the production collect/commit path.
+FakeEvaluator lineEvaluator(int n, std::vector<Move> line) {
+  return FakeEvaluator(n, [n, line](const uint8_t* planes, float* policy, float* value) {
+    for (int a = 0; a <= n * n; ++a) policy[a] = 1.0f;
+    for (Move m : line) {
+      if (m == kPass) {
+        policy[n * n] = 1000.0f;
+        break;
+      }
+      if (!occupied(planes, n, m)) {
+        policy[m] = 1000.0f;
+        break;
+      }
+    }
+    *value = 0.0f;
+  });
+}
+
+// Read-only walk: follows the edges for `moves` from the root; nullptr if an edge is
+// missing or its child has not been expanded by the search.
+const Node* walk(const Node& root, const std::vector<Move>& moves) {
+  const Node* nd = &root;
+  for (Move m : moves) {
+    const Edge* found = nullptr;
+    for (const Edge& e : nd->edges)
+      if (e.move == m) found = &e;
+    if (!found || !found->child) return nullptr;
+    nd = found->child.get();
+  }
+  return nd;
+}
+
 }  // namespace
 
 TEST_CASE("first selection at a fresh node is the highest prior") {
@@ -214,6 +257,24 @@ TEST_CASE("search converges on the only winning move in a 3-ply ladder") {
   CHECK(sum == doctest::Approx(1.0));
   CHECK(pi[pt(1, 3, n)] > 0.5f);
   CHECK(static_cast<int>(pi.size()) == n * n + 1);
+  // Per action: pi(a) = N(a) / sum N, zero for actions that are not root edges (a one-hot
+  // on the most visited move would also pass the three checks above).
+  {
+    std::map<int, uint32_t> visits;
+    uint32_t total = 0;
+    for (const Edge& e : tree.root().edges) {
+      visits[e.move == kPass ? n * n : e.move] = e.N;
+      total += e.N;
+    }
+    REQUIRE(total == tree.rootTotalVisits());
+    int nonzero = 0;
+    for (int a = 0; a <= n * n; ++a) {
+      const uint32_t na = visits.count(a) ? visits[a] : 0;
+      CHECK(pi[a] == doctest::Approx(static_cast<double>(na) / total));
+      nonzero += na > 0;
+    }
+    CHECK(nonzero >= 3);
+  }
   float bestQ = -2.0f;
   for (const Edge& e : tree.root().edges)
     if (e.move == pt(1, 3, n)) bestQ = e.Q();
@@ -326,6 +387,61 @@ TEST_CASE("resignation uses the root player's perspective") {
   CHECK_FALSE(t3.shouldResign());
 }
 
+TEST_CASE("resignation needs both the root value and the best Q below the threshold") {
+  // Values by depth, chosen so that every value backed up into a root edge has the same
+  // sign: a node at odd depth belongs to the opponent (its value is negated once on
+  // the way to the root edge), a node at even depth >= 2 to the root player. The root is
+  // the only position without stones (empty 5x5), black to move.
+  const int n = 5;
+  auto depthEvaluator = [n](float rootV, float edgeQ) {
+    return FakeEvaluator(n, [n, rootV, edgeQ](const uint8_t* planes, float* policy, float* value) {
+      for (int a = 0; a <= n * n; ++a) policy[a] = 1.0f;
+      if (!anyStone(planes, n)) *value = rootV;                    // root
+      else if (blackToMove(planes, n)) *value = edgeQ;              // even depth: root player
+      else *value = -edgeQ;                                         // odd depth: opponent
+    });
+  };
+  SearchParams p = testParams(20);
+  p.resignThreshold = -0.9f;
+  Board b(n, 7.5f);
+  GameHistory h;
+  h.reset(b.hash());
+
+  SUBCASE("root value low, best Q high: no resignation") {
+    FakeEvaluator ev = depthEvaluator(-0.95f, +0.95f);
+    SearchTree tree(p, n, 2);
+    tree.newGame(b, h);
+    tree.runSequential(ev);
+    CHECK(tree.rootValue() == doctest::Approx(-0.95f));
+    CHECK(tree.rootMaxQ() == doctest::Approx(0.95f));
+    CHECK_FALSE(tree.shouldResign());
+  }
+  SUBCASE("root value high, best Q low: no resignation") {
+    FakeEvaluator ev = depthEvaluator(+0.95f, -0.95f);
+    SearchTree tree(p, n, 2);
+    tree.newGame(b, h);
+    tree.runSequential(ev);
+    CHECK(tree.rootValue() == doctest::Approx(0.95f));
+    CHECK(tree.rootMaxQ() == doctest::Approx(-0.95f));
+    CHECK_FALSE(tree.shouldResign());
+  }
+  SUBCASE("both low: resignation") {
+    FakeEvaluator ev = depthEvaluator(-0.95f, -0.95f);
+    SearchTree tree(p, n, 2);
+    tree.newGame(b, h);
+    tree.runSequential(ev);
+    CHECK(tree.rootMaxQ() == doctest::Approx(-0.95f));
+    CHECK(tree.shouldResign());
+  }
+  SUBCASE("both just above the threshold: no resignation") {
+    FakeEvaluator ev = depthEvaluator(-0.85f, -0.85f);
+    SearchTree tree(p, n, 2);
+    tree.newGame(b, h);
+    tree.runSequential(ev);
+    CHECK_FALSE(tree.shouldResign());
+  }
+}
+
 TEST_CASE("superko-illegal moves are never expanded, including along the search path") {
   const int n = 5;
   // Black has just captured the ko at (1,2); white to move. Retaking at (1,1) is illegal now.
@@ -347,23 +463,98 @@ TEST_CASE("superko-illegal moves are never expanded, including along the search 
   tree.runSequential(ev);
   for (const Edge& e : tree.root().edges) CHECK(e.move != pt(1, 1, n));
   CHECK(tree.checkInvariants() == "");
-  // forceLine() expands nodes without backing up visits, so the visit-count invariants
-  // no longer hold after it; it is a debug helper only.
-  // Along a line: W threat (4,4), B answers (4,0), W retakes (1,1) (legal: new position),
-  // then B retaking (1,2) would recreate the position after (4,0) -> must be absent.
-  const Node* nd = tree.forceLine({pt(4, 4, n), pt(4, 0, n), pt(1, 1, n)}, ev);
-  REQUIRE(nd != nullptr);
-  REQUIRE(nd->state == NodeState::Expanded);
-  CHECK(nd->toMove == Color::Black);
-  bool hasRetake = false;
-  for (const Edge& e : nd->edges) hasRetake |= (e.move == pt(1, 2, n));
-  CHECK_FALSE(hasRetake);
-  // Sanity: the same retake IS legal one ply later if white passes in between.
-  const Node* nd2 = tree.forceLine({pt(4, 4, n), pt(4, 0, n), pt(1, 1, n), pt(0, 4, n), kPass}, ev);
-  REQUIRE(nd2 != nullptr);
-  bool hasRetake2 = false;
-  for (const Edge& e : nd2->edges) hasRetake2 |= (e.move == pt(1, 2, n));
-  CHECK(hasRetake2);
+
+  // Along a line reached by the ordinary search (collect/commit, path hashes built by
+  // the production code, not by forceLine): W threat (4,4), B answers (4,0), W retakes
+  // (1,1) (legal: new position), then B retaking (1,2) would recreate the position
+  // after (4,0) -> that edge must be absent at the node the search expanded.
+  {
+    const std::vector<Move> line{pt(4, 4, n), pt(4, 0, n), pt(1, 1, n)};
+    FakeEvaluator steer = lineEvaluator(n, line);
+    SearchTree t2(testParams(12), n, 4);
+    t2.newGame(b, h);
+    t2.runSequential(steer);
+    REQUIRE(t2.checkInvariants() == "");
+    const Node* nd = walk(t2.root(), line);
+    REQUIRE(nd != nullptr);
+    REQUIRE(nd->state == NodeState::Expanded);
+    CHECK(nd->toMove == Color::Black);
+    bool hasRetake = false;
+    for (const Edge& e : nd->edges) hasRetake |= (e.move == pt(1, 2, n));
+    CHECK_FALSE(hasRetake);
+    // The retake is absent for the superko reason only: every other empty point is an edge.
+    int emptyPoints = 0;
+    for (int q = 0; q < n * n; ++q) {
+      bool onBoard = false;
+      for (Move m : {pt(0, 1, n), pt(0, 2, n), pt(1, 0, n), pt(1, 3, n), pt(2, 1, n), pt(2, 2, n), pt(4, 4, n),
+                     pt(4, 0, n), pt(1, 1, n)})
+        onBoard |= (m == q);
+      emptyPoints += !onBoard;
+    }
+    CHECK(static_cast<int>(nd->edges.size()) == emptyPoints);  // all empty points minus the retake, plus pass
+  }
+  // Sanity through the same path: the retake IS legal after B(0,4), W pass.
+  {
+    const std::vector<Move> line{pt(4, 4, n), pt(4, 0, n), pt(1, 1, n), pt(0, 4, n), kPass};
+    FakeEvaluator steer = lineEvaluator(n, line);
+    SearchTree t3(testParams(14), n, 4);
+    t3.newGame(b, h);
+    t3.runSequential(steer);
+    REQUIRE(t3.checkInvariants() == "");
+    const Node* nd2 = walk(t3.root(), line);
+    REQUIRE(nd2 != nullptr);
+    REQUIRE(nd2->state == NodeState::Expanded);
+    CHECK(nd2->toMove == Color::Black);
+    bool hasRetake2 = false;
+    for (const Edge& e : nd2->edges) hasRetake2 |= (e.move == pt(1, 2, n));
+    CHECK(hasRetake2);
+  }
+}
+
+TEST_CASE("policy target is the normalised visit vector with pass at the last index") {
+  const int n = 5;
+  // Position of the superko test after black's capture: white to move, (1,1) is an
+  // illegal retake, several points are occupied.
+  Board b = Board::fromString(
+      ". X O . .\n"
+      "X O . O .\n"
+      ". X O . .\n"
+      ". . . . .\n"
+      ". . . . .\n",
+      7.5f, Color::Black);
+  GameHistory h;
+  h.reset(b.hash());
+  b.play(pt(1, 2, n));
+  h.push(pt(1, 2, n), b.hash());
+  // Uniform priors and zero values: 60 simulations over 16 legal edges visit every edge,
+  // pass included (a large pass prior would instead drive the search into pass-pass
+  // terminals and concentrate all visits there).
+  FakeEvaluator ev(n, 0.0f);
+  SearchTree tree(testParams(60), n, 5);
+  tree.newGame(b, h);
+  tree.runSequential(ev);
+  REQUIRE(tree.checkInvariants() == "");
+  std::vector<float> pi;
+  tree.policyTarget(pi);
+  REQUIRE(static_cast<int>(pi.size()) == n * n + 1);
+  std::map<int, uint32_t> visits;
+  uint32_t total = 0;
+  for (const Edge& e : tree.root().edges) {
+    visits[e.move == kPass ? n * n : e.move] = e.N;
+    total += e.N;
+  }
+  REQUIRE(total == 60);
+  int nonzero = 0;
+  for (int a = 0; a <= n * n; ++a) {
+    const uint32_t na = visits.count(a) ? visits[a] : 0;
+    CHECK(pi[a] == doctest::Approx(static_cast<double>(na) / total));
+    nonzero += pi[a] > 0.0f;
+  }
+  CHECK(nonzero >= 3);                 // not a one-hot
+  CHECK(pi[n * n] > 0.0f);             // pass visited, at the last index
+  CHECK(pi[pt(1, 1, n)] == 0.0f);      // illegal retake
+  CHECK(pi[pt(0, 1, n)] == 0.0f);      // occupied
+  CHECK(pi[pt(1, 2, n)] == 0.0f);      // occupied (the capturing stone)
 }
 
 TEST_CASE("invariants hold after every simulation and evaluations are counted") {
