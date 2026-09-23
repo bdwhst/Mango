@@ -90,6 +90,22 @@ add_executable(mango_gtp cpp/gtp/gtp_main.cpp)
 target_link_libraries(mango_gtp PRIVATE mango_gtp_lib mango_nn)
 mango_copy_torch_dlls(mango_gtp)
 
+# Self-play: chunk format + sequential game runner (evaluator-agnostic) + executable.
+add_library(mango_selfplay_lib STATIC cpp/selfplay/chunk.cpp cpp/selfplay/game_runner.cpp)
+target_link_libraries(mango_selfplay_lib PUBLIC mango_core mango_search)
+
+add_executable(mango_selfplay cpp/selfplay/selfplay_main.cpp)
+target_link_libraries(mango_selfplay PRIVATE mango_selfplay_lib mango_nn)
+mango_copy_torch_dlls(mango_selfplay)
+
+# Match driver: colour-swapped pairs, bootstrap interval + executable.
+add_library(mango_match_lib STATIC cpp/match/match.cpp)
+target_link_libraries(mango_match_lib PUBLIC mango_core mango_search mango_selfplay_lib)
+
+add_executable(mango_match cpp/match/match_main.cpp)
+target_link_libraries(mango_match PRIVATE mango_match_lib mango_nn)
+mango_copy_torch_dlls(mango_match)
+
 # ---------------------------------------------------------------------------
 # Tests
 if(MANGO_BUILD_TESTS)
@@ -103,12 +119,15 @@ if(MANGO_BUILD_TESTS)
     cpp/tests/test_sgf_config.cpp
     cpp/tests/test_gtp.cpp
     cpp/tests/test_mcts.cpp
-    cpp/tests/test_mcts_player.cpp)
+    cpp/tests/test_mcts_player.cpp
+    cpp/tests/test_chunk.cpp
+    cpp/tests/test_selfplay.cpp
+    cpp/tests/test_match.cpp)
   if(MANGO_WITH_TORCH)
     target_sources(mango_tests PRIVATE cpp/tests/test_torch_eval.cpp)
   endif()
   target_compile_definitions(mango_tests PRIVATE MANGO_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/cpp/tests/fixtures")
-  target_link_libraries(mango_tests PRIVATE mango_core mango_nn mango_search mango_gtp_lib)
+  target_link_libraries(mango_tests PRIVATE mango_core mango_nn mango_search mango_gtp_lib mango_selfplay_lib mango_match_lib)
   add_test(NAME mango_tests COMMAND mango_tests)
   mango_copy_torch_dlls(mango_tests)
 endif()

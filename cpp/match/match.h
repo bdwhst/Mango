@@ -1,0 +1,65 @@
+// Match between two players (docs/DESIGN.md section 5.8): independent evaluators and
+// trees, an opening set played as colour-swapped pairs, pair scores and a bootstrap
+// interval. Evaluator-agnostic so tests can use FakeEvaluator.
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "core/types.h"
+#include "nn/evaluator.h"
+#include "search/search_params.h"
+#include "selfplay/chunk.h"
+
+namespace mango {
+
+struct Opening {
+  std::vector<Move> moves;
+};
+
+// `count` distinct openings of `k` uniformly random legal moves each (seeded). Fewer
+// are returned if the board cannot provide that many distinct ones.
+std::vector<Opening> generateRandomOpenings(int n, float komi, int moveCap, int count, int k, uint64_t seed);
+
+struct MatchPlayer {
+  NNEvaluator* ev = nullptr;
+  SearchParams params;  // eval params: no noise, tau -> 0, fixed simulations
+  std::string name;
+};
+
+struct MatchGame {
+  int pair = 0;
+  bool aIsBlack = true;
+  std::vector<Move> moves;  // opening included
+  int8_t result = 0;        // +1 black, -1 white, 0 draw
+  float score = 0.0f;
+  Termination termination = Termination::TwoPasses;
+  float scoreForA() const { return result == 0 ? 0.5f : ((result > 0) == aIsBlack ? 1.0f : 0.0f); }
+};
+
+struct MatchReport {
+  std::string nameA, nameB;
+  int boardSize = 0;
+  float komi = 0.0f;
+  int simulations = 0;
+  uint64_t seed = 0;
+  std::vector<Opening> openings;
+  std::vector<MatchGame> games;   // 2 per opening: A black first, then A white
+  std::vector<float> pairScores;  // mean of A's two game scores per opening
+  double meanPairScore = 0.0;
+  double ciLow = 0.0, ciHigh = 0.0;  // 95% bootstrap percentile interval over pairs
+  int uniqueTrajectories = 0;
+  int winsA = 0, lossesA = 0, drawsA = 0;
+};
+
+// Plays every opening twice with colours swapped. Game seeds derive from `seed`.
+MatchReport playMatch(MatchPlayer a, MatchPlayer b, int n, float komi, int moveCap, const std::vector<Opening>& openings,
+                      uint64_t seed);
+
+// Percentile bootstrap (2.5%, 97.5%) of the mean over `resamples` seeded resamples.
+std::pair<double, double> bootstrapMeanInterval(const std::vector<float>& values, int resamples, uint64_t seed);
+
+std::string matchReportToJson(const MatchReport& r);
+
+}  // namespace mango
