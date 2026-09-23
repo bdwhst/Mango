@@ -1,6 +1,6 @@
 // mango_match: colour-swapped pairs between two model directories (DESIGN 5.8).
 //   mango_match --a DIR --b DIR --config CFG --pairs N [--sims S] [--seed S]
-//               [--openings K] [--out report.json] [--device D] [--fp32]
+//               [--openings K] [--out report.json] [--device D] [--fp32] [--games-in-flight G]
 // Prints the JSON report to stdout (and to --out when given).
 #include <cstdlib>
 #include <fstream>
@@ -15,7 +15,7 @@
 
 int main(int argc, char** argv) {
   std::string a, b, configPath, outPath, device = "auto";
-  int pairs = -1, sims = -1, openingMoves = -1;
+  int pairs = -1, sims = -1, openingMoves = -1, gamesInFlight = 32;
   uint64_t seed = 1;
   bool fp32 = false;
   for (int i = 1; i < argc; ++i) {
@@ -35,6 +35,7 @@ int main(int argc, char** argv) {
     else if (arg == "--seed") seed = std::strtoull(next().c_str(), nullptr, 10);
     else if (arg == "--openings") openingMoves = std::atoi(next().c_str());
     else if (arg == "--out") outPath = next();
+    else if (arg == "--games-in-flight") gamesInFlight = std::atoi(next().c_str());
     else if (arg == "--device") device = next();
     else if (arg == "--fp32") fp32 = true;
     else {
@@ -69,7 +70,7 @@ int main(int argc, char** argv) {
                                                   cfg.eval.openingMoves, seed);
     std::cerr << "mango_match: " << evA.modelId() << " vs " << evB.modelId() << ", " << openings.size() << " pairs, "
               << pa.params.simulations << " sims/move on " << evA.deviceName() << "\n";
-    mango::MatchReport r = mango::playMatch(pa, pb, n, cfg.board.komi, cfg.board.effectiveMoveCap(), openings, seed);
+    mango::MatchReport r = mango::playMatch(pa, pb, n, cfg.board.komi, cfg.board.effectiveMoveCap(), openings, seed, gamesInFlight);
     const std::string json = mango::matchReportToJson(r);
     if (!outPath.empty()) {
       std::ofstream f(outPath + ".tmp");

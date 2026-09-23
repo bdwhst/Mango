@@ -3,7 +3,6 @@
 #include <vector>
 
 #include "core/random.h"
-#include "search/mcts.h"
 
 namespace mango {
 
@@ -26,14 +25,6 @@ class CountingEvaluator : public NNEvaluator {
   int positions_ = 0;
 };
 
-void snapshotOf(const Board& board, std::vector<uint8_t>& out) {
-  const int n = board.size();
-  std::vector<Color> cells(n * n);
-  for (int p = 0; p < n * n; ++p) cells[p] = board.atPoint(p);
-  out.resize(packedSnapshotBytes(n));
-  packSnapshot(cells.data(), n, out.data());
-}
-
 }  // namespace
 
 bool isNoResignGame(uint64_t gameSeed, float fraction) {
@@ -43,76 +34,95 @@ bool isNoResignGame(uint64_t gameSeed, float fraction) {
   return static_cast<double>(r) < static_cast<double>(fraction) * 10000.0;
 }
 
-SelfplayGameResult playSelfplayGame(NNEvaluator& evIn, const SelfplayGameOptions& opt, const std::string& modelId) {
-  const int n = opt.boardSize;
-  const int nn = n * n;
-  CountingEvaluator ev(evIn);
-  Board board(n, opt.komi, opt.moveCap);
-  GameHistory hist;
-  hist.reset(board.hash());
-  SearchTree tree(opt.params, n, opt.gameSeed);
-  tree.newGame(board, hist);
+SelfplayGame::SelfplayGame(const SelfplayGameOptions& opt, std::string modelId)
+    : opt_(opt), modelId_(std::move(modelId)), board_(opt.boardSize, opt.komi, opt.moveCap) {
+  hist_.reset(board_.hash());
+  tree_ = std::make_unique<SearchTree>(opt_.params, opt_.boardSize, opt_.gameSeed);
+  tree_->newGame(board_, hist_);
+  record_.gameSeed = opt_.gameSeed;
+  record_.noResignGame = opt_.noResignGame;
+  snapshot();
+  if (board_.gameOver()) finished_ = true;  // move cap 0: nothing to play
+}
 
-  SelfplayGameResult res;
-  GameRecord& g = res.record;
-  g.gameSeed = opt.gameSeed;
-  g.noResignGame = opt.noResignGame;
-  g.snapshots.emplace_back();
-  snapshotOf(board, g.snapshots.back());
+void SelfplayGame::snapshot() {
+  const int n = board_.size();
+  std::vector<Color> cells(n * n);
+  for (int p = 0; p < n * n; ++p) cells[p] = board_.atPoint(p);
+  record_.snapshots.emplace_back(packedSnapshotBytes(n));
+  packSnapshot(cells.data(), n, record_.snapshots.back().data());
+}
 
-  bool resigned = false;
-  Color resigner = Color::Empty;
-  const bool resignEnabled = opt.params.resignThreshold > -1.0f && !opt.noResignGame;
-  while (!board.gameOver()) {
-    tree.runSequential(ev);
-    const float v = tree.rootValue();
-    const float maxQ = tree.rootMaxQ();
-    if (resignEnabled && tree.shouldResign()) {
-      resigned = true;
-      resigner = board.toMove();
-      break;
-    }
-    const Move m = tree.selectMove(board.moveCount());
-    MoveVisits mv;
-    mv.rootTotalVisits = tree.rootTotalVisits();
-    std::vector<std::pair<Move, uint32_t>> rv;
-    tree.rootVisits(rv);
-    for (const auto& [mv_move, cnt] : rv) mv.counts.emplace_back(static_cast<uint16_t>(mv_move == kPass ? nn : mv_move), cnt);
-    g.moves.push_back(static_cast<uint16_t>(m == kPass ? nn : m));
-    g.rootValue.push_back(v);
-    g.rootMaxQ.push_back(maxQ);
-    g.visits.push_back(std::move(mv));
-    if (opt.storeSearchKind) g.searchKind.push_back(1);
-    board.play(m);
-    hist.push(m, board.hash());
-    tree.advance(m, board, hist);
-    g.snapshots.emplace_back();
-    snapshotOf(board, g.snapshots.back());
+bool SelfplayGame::finishMove() {
+  if (finished_) return true;
+  const int nn = board_.numPoints();
+  const float v = tree_->rootValue();
+  const float maxQ = tree_->rootMaxQ();
+  const bool resignEnabled = opt_.params.resignThreshold > -1.0f && !opt_.noResignGame;
+  if (resignEnabled && tree_->shouldResign()) {
+    resigned_ = true;
+    resigner_ = board_.toMove();
+    finished_ = true;
+    return true;
   }
+  const Move m = tree_->selectMove(board_.moveCount());
+  MoveVisits mv;
+  mv.rootTotalVisits = tree_->rootTotalVisits();
+  std::vector<std::pair<Move, uint32_t>> rv;
+  tree_->rootVisits(rv);
+  for (const auto& [move, cnt] : rv) mv.counts.emplace_back(static_cast<uint16_t>(move == kPass ? nn : move), cnt);
+  record_.moves.push_back(static_cast<uint16_t>(m == kPass ? nn : m));
+  record_.rootValue.push_back(v);
+  record_.rootMaxQ.push_back(maxQ);
+  record_.visits.push_back(std::move(mv));
+  if (opt_.storeSearchKind) record_.searchKind.push_back(1);
+  board_.play(m);
+  hist_.push(m, board_.hash());
+  tree_->advance(m, board_, hist_);
+  snapshot();
+  if (board_.gameOver()) finished_ = true;
+  return finished_;
+}
 
-  g.score = board.score();
-  if (resigned) {
+SelfplayGameResult SelfplayGame::takeResult(int evaluations) {
+  const int n = board_.size();
+  const int nn = n * n;
+  SelfplayGameResult res;
+  GameRecord& g = record_;
+  g.score = board_.score();
+  if (resigned_) {
     g.termination = Termination::Resign;
-    g.result = resigner == Color::Black ? -1 : 1;
+    g.result = resigner_ == Color::Black ? -1 : 1;
   } else {
-    g.termination = board.consecutivePasses() >= 2 ? Termination::TwoPasses : Termination::MoveCap;
+    g.termination = board_.consecutivePasses() >= 2 ? Termination::TwoPasses : Termination::MoveCap;
     g.result = g.score > 0 ? 1 : (g.score < 0 ? -1 : 0);
   }
-  if (opt.storeFinalOwnership) {
+  if (opt_.storeFinalOwnership) {
     g.finalOwnership.resize(nn);
-    board.areaOwnership(g.finalOwnership.data());
+    board_.areaOwnership(g.finalOwnership.data());
   }
-
   res.sgf.size = n;
-  res.sgf.komi = opt.komi;
+  res.sgf.komi = opt_.komi;
   for (uint16_t m : g.moves) res.sgf.moves.push_back(m == nn ? kPass : static_cast<Move>(m));
-  res.sgf.result = resultString(g.score, resigned, resigned ? opposite(resigner) : Color::Empty);
-  res.sgf.blackName = "mango " + modelId;
-  res.sgf.whiteName = "mango " + modelId;
-  res.sgf.comment = "game_seed=" + std::to_string(opt.gameSeed) + " model=" + modelId +
-                    (opt.noResignGame ? " no_resign=1" : " no_resign=0");
-  res.evaluations = ev.positions();
+  res.sgf.result = resultString(g.score, resigned_, resigned_ ? opposite(resigner_) : Color::Empty);
+  res.sgf.blackName = "mango " + modelId_;
+  res.sgf.whiteName = "mango " + modelId_;
+  res.sgf.comment = "game_seed=" + std::to_string(opt_.gameSeed) + " model=" + modelId_ +
+                    (opt_.noResignGame ? " no_resign=1" : " no_resign=0");
+  res.evaluations = evaluations;
+  res.record = std::move(record_);
+  record_ = GameRecord();
   return res;
+}
+
+SelfplayGameResult playSelfplayGame(NNEvaluator& evIn, const SelfplayGameOptions& opt, const std::string& modelId) {
+  CountingEvaluator ev(evIn);
+  SelfplayGame game(opt, modelId);
+  while (!game.finished()) {
+    game.tree().runSequential(ev);
+    game.finishMove();
+  }
+  return game.takeResult(ev.positions());
 }
 
 }  // namespace mango

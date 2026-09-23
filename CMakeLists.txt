@@ -91,7 +91,7 @@ target_link_libraries(mango_gtp PRIVATE mango_gtp_lib mango_nn)
 mango_copy_torch_dlls(mango_gtp)
 
 # Self-play: chunk format + sequential game runner (evaluator-agnostic) + executable.
-add_library(mango_selfplay_lib STATIC cpp/selfplay/chunk.cpp cpp/selfplay/game_runner.cpp)
+add_library(mango_selfplay_lib STATIC cpp/selfplay/chunk.cpp cpp/selfplay/game_runner.cpp cpp/selfplay/batch_runner.cpp)
 target_link_libraries(mango_selfplay_lib PUBLIC mango_core mango_search)
 
 add_executable(mango_selfplay cpp/selfplay/selfplay_main.cpp)

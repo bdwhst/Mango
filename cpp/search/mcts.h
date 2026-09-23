@@ -50,6 +50,13 @@ class SearchTree {
   void runSequential(NNEvaluator& ev);
 
   // --- Batched protocol ---------------------------------------------------------
+  // Call once at the start of every move before collecting leaves: a reused
+  // (already expanded) root gets its root noise here, exactly as runSequential does.
+  // An unexpanded root is expanded by the first collectLeaf/commit (not a simulation).
+  void prepareRoot();
+  bool rootExpanded() const { return root_->state == NodeState::Expanded; }
+  bool gameOverAtRoot() const { return rootBoard_.gameOver(); }
+  int pendingCount() const { return pendingCount_; }
   // Descends from the root with virtual loss. Pending: `leaf` holds a request that
   // must be committed or aborted. Completed: a terminal was backed up (counts as a
   // simulation). Collision: a Pending node was reached; reservations were removed.

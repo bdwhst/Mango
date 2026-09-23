@@ -104,7 +104,7 @@ TEST_CASE("match plays every opening twice with colours swapped and scores on pa
   MatchPlayer a{&evA, evalParams(8), "A"};
   MatchPlayer b{&evB, evalParams(8), "B"};
   auto openings = generateRandomOpenings(n, 7.5f, 50, 5, 2, 4);
-  MatchReport r = playMatch(a, b, n, 7.5f, 50, openings, 11);
+  MatchReport r = playMatch(a, b, n, 7.5f, 50, openings, 11, /*gamesInFlight=*/1);
   REQUIRE(r.games.size() == 10);
   REQUIRE(r.pairScores.size() == 5);
   double mean = 0.0;
@@ -143,10 +143,19 @@ TEST_CASE("match plays every opening twice with colours swapped and scores on pa
   CHECK(r.uniqueTrajectories <= 10);
   CHECK(r.ciLow <= r.meanPairScore);
   CHECK(r.ciHigh >= r.meanPairScore);
-  // Deterministic under the same seed.
-  MatchReport r2 = playMatch(a, b, n, 7.5f, 50, openings, 11);
-  CHECK(r2.pairScores == r.pairScores);
-  for (size_t i = 0; i < r.games.size(); ++i) CHECK(r2.games[i].moves == r.games[i].moves);
+  // Deterministic under the same seed, and independent of how many games are in flight
+  // (K = 1 per game: every game's search is exactly the sequential search).
+  for (int inFlight : {1, 3, 10}) {
+    CAPTURE(inFlight);
+    MatchReport r2 = playMatch(a, b, n, 7.5f, 50, openings, 11, inFlight);
+    CHECK(r2.pairScores == r.pairScores);
+    REQUIRE(r2.games.size() == r.games.size());
+    for (size_t i = 0; i < r.games.size(); ++i) {
+      CHECK(r2.games[i].moves == r.games[i].moves);
+      CHECK(r2.games[i].pair == r.games[i].pair);
+      CHECK(r2.games[i].aIsBlack == r.games[i].aIsBlack);
+    }
+  }
   // Report JSON carries the numbers.
   nlohmann::json j = nlohmann::json::parse(matchReportToJson(r));
   CHECK(j["pairs"] == 5);

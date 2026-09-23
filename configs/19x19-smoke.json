@@ -1,0 +1,32 @@
+{
+  "board": {"size": 19, "komi": 7.5, "move_cap": -1},
+  "search": {
+    "simulations": 800,
+    "eval_simulations": 800,
+    "c_puct": 1.5,
+    "fpu": "zero",
+    "dirichlet_alpha": 0.03,
+    "dirichlet_epsilon": 0.25,
+    "temperature_moves": 30,
+    "search_symmetry": true,
+    "tree_reuse": true,
+    "resign_threshold": -1.0,
+    "no_resign_fraction": 0.10
+  },
+  "selfplay": {"games_per_iteration": 20, "games_in_flight": 20, "leaves_per_game": 1, "chunk_games": 20, "save_sgf": true},
+  "training": {
+    "res_blocks": 20,
+    "filters": 128,
+    "batch_size": 256,
+    "max_steps_per_iteration": 50,
+    "samples_per_position": 0.25,
+    "window_games": 1000,
+    "holdout_fraction": 0.05,
+    "l2": 1e-4,
+    "store_pi": "visits",
+    "lr0": 0.01,
+    "lr_step1": 30000,
+    "lr_step2": 60000
+  },
+  "eval": {"pairs": 4, "gate_threshold": 0.55, "opening_moves": 4, "ladder_every": 5, "gating": true}
+}

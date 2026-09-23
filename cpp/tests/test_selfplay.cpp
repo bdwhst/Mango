@@ -180,3 +180,179 @@ TEST_CASE("no-resign tagging follows the configured fraction and is seed-determi
   CHECK(tagged < N * 0.13);
   CHECK(isNoResignGame(77, 0.10f) == isNoResignGame(77, 0.10f));
 }
+
+// ---------------------------------------------------------------------------------
+// Batched driver (DESIGN 5.4.5, K = 1 across games): every game equals its sequential run.
+#include <stdexcept>
+
+#include "selfplay/batch_runner.h"
+
+namespace {
+
+// Value from the perspective of the player to move, as a function of the position.
+FakeEvaluator colorValueEvaluator(int n, float valueForBlack) {
+  return FakeEvaluator(n, [n, valueForBlack](const uint8_t* planes, float* policy, float* value) {
+    for (int a = 0; a <= n * n; ++a) policy[a] = 1.0f;
+    *value = blackToMove(planes, n) ? valueForBlack : -valueForBlack;
+  });
+}
+
+bool sameRecord(const GameRecord& a, const GameRecord& b) {
+  if (a.moves != b.moves || a.snapshots != b.snapshots || a.rootValue != b.rootValue || a.rootMaxQ != b.rootMaxQ) return false;
+  if (a.result != b.result || a.termination != b.termination || a.score != b.score || a.gameSeed != b.gameSeed) return false;
+  if (a.visits.size() != b.visits.size()) return false;
+  for (size_t t = 0; t < a.visits.size(); ++t)
+    if (a.visits[t].rootTotalVisits != b.visits[t].rootTotalVisits || a.visits[t].counts != b.visits[t].counts) return false;
+  return true;
+}
+
+SelfplayGameOptions optionsFor(int n, int sims, uint64_t seed, bool symmetry) {
+  SelfplayGameOptions opt;
+  opt.boardSize = n;
+  opt.komi = 7.5f;
+  opt.moveCap = 2 * n * n;
+  opt.params = selfplayParams(sims);
+  opt.params.searchSymmetry = symmetry;
+  opt.gameSeed = seed;
+  return opt;
+}
+
+}  // namespace
+
+TEST_CASE("batched self-play reproduces every game's sequential run (K = 1 across games)") {
+  const int n = 5;
+  for (bool symmetry : {false, true}) {
+    CAPTURE(symmetry);
+    FakeEvaluator ev = colorValueEvaluator(n, 0.1f);
+    const int total = 7;  // more games than slots: slots are refilled
+    BatchedSelfplay driver(ev, /*gamesInFlight=*/3, "m");
+    std::vector<GameRecord> batched(total);
+    std::vector<int> evals(total, 0);
+    BatchStats st = driver.run(
+        total, [&](int i) { return optionsFor(n, 12, 100 + i, symmetry); },
+        [&](int i, SelfplayGameResult&& r) {
+          batched[i] = std::move(r.record);
+          evals[i] = r.evaluations;
+        });
+    CHECK(st.games == total);
+    CHECK(st.batches > 0);
+    CHECK(st.avgBatch() > 1.0);
+    CHECK(st.avgBatch() <= 3.0);
+    CHECK(st.retries == 0);
+    uint64_t positions = 0, evaluations = 0;
+    for (int i = 0; i < total; ++i) {
+      FakeEvaluator seq = colorValueEvaluator(n, 0.1f);
+      SelfplayGameResult s = playSelfplayGame(seq, optionsFor(n, 12, 100 + i, symmetry), "m");
+      CHECK_MESSAGE(sameRecord(batched[i], s.record), "game " << i << " differs from its sequential run");
+      CHECK(evals[i] == s.evaluations);
+      positions += static_cast<uint64_t>(s.record.T());
+      evaluations += static_cast<uint64_t>(s.evaluations);
+    }
+    CHECK(st.positions == positions);
+    CHECK(st.evaluations == evaluations);
+  }
+}
+
+TEST_CASE("batched self-play retries a failed batch once and keeps completed simulations") {
+  const int n = 5;
+  int failuresLeft = 1;
+  int calls = 0;
+  FakeEvaluator flaky(n, [&](const uint8_t*, float* policy, float* value) {
+    for (int a = 0; a <= n * n; ++a) policy[a] = 1.0f;
+    *value = 0.0f;
+  });
+  // Wrap: throw on the 5th evaluator call once.
+  class Wrapper : public NNEvaluator {
+   public:
+    Wrapper(NNEvaluator& inner, int& calls, int& failuresLeft) : inner_(inner), calls_(calls), failures_(failuresLeft) {}
+    int boardSize() const override { return inner_.boardSize(); }
+    const std::string& modelId() const override { return inner_.modelId(); }
+    void evaluate(const std::vector<NNInput>& in, std::vector<NNOutput>& out) override {
+      ++calls_;
+      if (calls_ == 5 && failures_ > 0) {
+        --failures_;
+        throw std::runtime_error("simulated failure");
+      }
+      inner_.evaluate(in, out);
+    }
+
+   private:
+    NNEvaluator& inner_;
+    int& calls_;
+    int& failures_;
+  } ev(flaky, calls, failuresLeft);
+  // With search symmetry ON: a retry must reuse the original requests, otherwise the
+  // re-collected leaves draw new symmetries and the games diverge from their seeds.
+  for (bool symmetry : {true, false}) {
+    CAPTURE(symmetry);
+    calls = 0;
+    failuresLeft = 1;
+    BatchedSelfplay driver(ev, 2, "m");
+    std::vector<GameRecord> got(2);
+    BatchStats st = driver.run(
+        2, [&](int i) { return optionsFor(n, 10, 300 + i, symmetry); },
+        [&](int i, SelfplayGameResult&& r) { got[i] = std::move(r.record); });
+    CHECK(st.retries == 1);
+    CHECK(st.games == 2);
+    for (int i = 0; i < 2; ++i) {
+      FakeEvaluator seq(n, 0.0f);
+      SelfplayGameResult s = playSelfplayGame(seq, optionsFor(n, 10, 300 + i, symmetry), "m");
+      CHECK_MESSAGE(sameRecord(got[i], s.record), "game " << i << " diverged after the retry");
+    }
+  }
+  // Two consecutive failures abort the run and leave no pending node.
+  int always = 1 << 20;
+  int calls2 = 0;
+  class AlwaysFail : public NNEvaluator {
+   public:
+    AlwaysFail(int& calls, int& fails) : calls_(calls), fails_(fails) {}
+    int boardSize() const override { return 5; }
+    const std::string& modelId() const override { return id_; }
+    void evaluate(const std::vector<NNInput>&, std::vector<NNOutput>&) override {
+      ++calls_;
+      if (calls_ >= 3) {
+        --fails_;
+        throw std::runtime_error("down");
+      }
+      throw std::runtime_error("down");
+    }
+
+   private:
+    int& calls_;
+    int& fails_;
+    std::string id_ = "fail";
+  } bad(calls2, always);
+  BatchedSelfplay d2(bad, 2, "m");
+  CHECK_THROWS(d2.run(2, [&](int i) { return optionsFor(n, 10, 400 + i, false); }, [&](int, SelfplayGameResult&&) {}));
+}
+
+TEST_CASE("batched self-play handles games that are over before their first move") {
+  const int n = 5;
+  FakeEvaluator ev(n, 0.0f);
+  BatchedSelfplay driver(ev, 3, "m");
+  std::vector<GameRecord> got(5);
+  int done = 0;
+  BatchStats st = driver.run(
+      5,
+      [&](int i) {
+        SelfplayGameOptions o = optionsFor(n, 8, 500 + i, false);
+        o.moveCap = (i % 2 == 0) ? 0 : 4;  // every other game has nothing to play
+        return o;
+      },
+      [&](int i, SelfplayGameResult&& r) {
+        got[i] = std::move(r.record);
+        ++done;
+      });
+  CHECK(done == 5);
+  CHECK(st.games == 5);
+  for (int i = 0; i < 5; ++i) {
+    FakeEvaluator seq(n, 0.0f);
+    SelfplayGameOptions o = optionsFor(n, 8, 500 + i, false);
+    o.moveCap = (i % 2 == 0) ? 0 : 4;
+    SelfplayGameResult s = playSelfplayGame(seq, o, "m");
+    CHECK(got[i].T() == ((i % 2 == 0) ? 0 : 4));
+    CHECK(got[i].termination == Termination::MoveCap);
+    CHECK(sameRecord(got[i], s.record));
+  }
+  CHECK(ev.positions() == static_cast<int>(st.evaluations));
+}

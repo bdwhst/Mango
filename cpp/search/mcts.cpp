@@ -238,12 +238,18 @@ void SearchTree::abort(PendingLeaf& leaf) {
   leaf.nodes.clear();
 }
 
+void SearchTree::prepareRoot() {
+  if (root_->state == NodeState::Expanded) addRootNoise();
+}
+
 void SearchTree::runSequential(NNEvaluator& ev) {
   if (rootBoard_.gameOver()) return;
   PendingLeaf leaf;
   std::vector<NNInput> in(1);
   std::vector<NNOutput> out;
-  // Root expansion (does not count against the budget), then noise.
+  // Root expansion (does not count against the budget), then noise. The batched
+  // driver (selfplay/batch_runner.cpp) issues exactly this sequence of calls per game.
+  prepareRoot();
   if (root_->state == NodeState::Unexpanded) {
     CollectResult r = collectLeaf(leaf);
     if (r == CollectResult::Pending) {
@@ -256,8 +262,6 @@ void SearchTree::runSequential(NNEvaluator& ev) {
       }
       commit(leaf, out[0]);
     }
-  } else if (root_->state == NodeState::Expanded) {
-    addRootNoise();
   }
   while (!budgetExhausted()) {
     CollectResult r = collectLeaf(leaf);

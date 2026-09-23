@@ -1,7 +1,9 @@
 #include "match/match.h"
 
 #include <algorithm>
+#include <memory>
 #include <set>
+#include <stdexcept>
 #include <sstream>
 
 #include "core/board.h"
@@ -46,36 +48,79 @@ std::vector<Opening> generateRandomOpenings(int n, float komi, int moveCap, int 
 
 namespace {
 
-MatchGame playOne(MatchPlayer& black, MatchPlayer& white, int n, float komi, int moveCap, const Opening& opening,
-                  uint64_t seedBlack, uint64_t seedWhite) {
-  Board board(n, komi, moveCap);
+// One game in flight: both sides' trees follow the same board.
+struct MatchSlot {
+  int pair = 0;
+  bool aIsBlack = true;
+  Board board;
   GameHistory hist;
-  hist.reset(board.hash());
-  SearchTree tb(black.params, n, seedBlack);
-  SearchTree tw(white.params, n, seedWhite);
-  tb.newGame(board, hist);
-  tw.newGame(board, hist);
-  MatchGame g;
-  auto apply = [&](Move m) {
+  std::unique_ptr<SearchTree> tb, tw;
+  MatchGame game;
+  PendingLeaf leaf;
+  bool active = false;
+  MatchSlot() : board(2, 0.0f) {}
+
+  SearchTree& treeToMove() { return board.toMove() == Color::Black ? *tb : *tw; }
+  bool moverIsA() const { return (board.toMove() == Color::Black) == aIsBlack; }
+
+  void start(int pairIdx, bool aBlack, MatchPlayer& black, MatchPlayer& white, int n, float komi, int moveCap,
+             const Opening& opening, uint64_t seedBlack, uint64_t seedWhite) {
+    pair = pairIdx;
+    aIsBlack = aBlack;
+    board = Board(n, komi, moveCap);
+    hist.reset(board.hash());
+    tb = std::make_unique<SearchTree>(black.params, n, seedBlack);
+    tw = std::make_unique<SearchTree>(white.params, n, seedWhite);
+    tb->newGame(board, hist);
+    tw->newGame(board, hist);
+    game = MatchGame();
+    game.pair = pairIdx;
+    game.aIsBlack = aBlack;
+    for (Move m : opening.moves) apply(m);
+    active = true;
+    if (!board.gameOver()) treeToMove().prepareRoot();
+  }
+  void apply(Move m) {
     board.play(m);
     hist.push(m, board.hash());
-    tb.advance(m, board, hist);
-    tw.advance(m, board, hist);
-    g.moves.push_back(m);
-  };
-  for (Move m : opening.moves) apply(m);
-  while (!board.gameOver()) {
-    const bool blackToMove = board.toMove() == Color::Black;
-    SearchTree& tree = blackToMove ? tb : tw;
-    NNEvaluator& ev = *(blackToMove ? black.ev : white.ev);
-    tree.runSequential(ev);
-    apply(tree.selectMove(board.moveCount()));
+    tb->advance(m, board, hist);
+    tw->advance(m, board, hist);
+    game.moves.push_back(m);
   }
-  g.score = board.score();
-  g.result = g.score > 0 ? 1 : (g.score < 0 ? -1 : 0);
-  g.termination = board.consecutivePasses() >= 2 ? Termination::TwoPasses : Termination::MoveCap;
-  return g;
-}
+  void finishGame() {
+    game.score = board.score();
+    game.result = game.score > 0 ? 1 : (game.score < 0 ? -1 : 0);
+    game.termination = board.consecutivePasses() >= 2 ? Termination::TwoPasses : Termination::MoveCap;
+    active = false;
+  }
+  // Same call sequence as SearchTree::runSequential for the side to move (DESIGN 5.4.5).
+  // Returns true with a pending leaf, false when the game ended.
+  bool collect() {
+    for (;;) {
+      if (board.gameOver()) {
+        finishGame();
+        return false;
+      }
+      SearchTree& tree = treeToMove();
+      if (!tree.rootExpanded()) {
+        if (tree.collectLeaf(leaf) != CollectResult::Pending) throw std::logic_error("unexpected collect result at the root");
+        return true;
+      }
+      if (tree.budgetExhausted()) {
+        apply(tree.selectMove(board.moveCount()));
+        if (board.gameOver()) {
+          finishGame();
+          return false;
+        }
+        treeToMove().prepareRoot();
+        continue;
+      }
+      const CollectResult r = tree.collectLeaf(leaf);
+      if (r == CollectResult::Pending) return true;
+      if (r == CollectResult::Collision) throw std::logic_error("collision with K = 1");
+    }
+  }
+};
 
 uint64_t trajectoryHash(const std::vector<Move>& moves) {
   uint64_t h = 0x4D616E676F4D6174ull;
@@ -108,7 +153,7 @@ std::pair<double, double> bootstrapMeanInterval(const std::vector<float>& values
 }
 
 MatchReport playMatch(MatchPlayer a, MatchPlayer b, int n, float komi, int moveCap, const std::vector<Opening>& openings,
-                      uint64_t seed) {
+                      uint64_t seed, int gamesInFlight) {
   MatchReport r;
   r.nameA = a.name;
   r.nameB = b.name;
@@ -117,25 +162,64 @@ MatchReport playMatch(MatchPlayer a, MatchPlayer b, int n, float komi, int moveC
   r.simulations = a.params.simulations;
   r.seed = seed;
   r.openings = openings;
+  const int totalGames = static_cast<int>(openings.size()) * 2;
+  r.games.resize(static_cast<size_t>(totalGames));
+  const int G = gamesInFlight <= 0 ? std::max(1, totalGames) : std::min(gamesInFlight, std::max(1, totalGames));
+  std::vector<MatchSlot> slots(static_cast<size_t>(G));
+  int nextGame = 0;
+  auto startNext = [&](MatchSlot& s) {
+    if (nextGame >= totalGames) return false;
+    const int gi = nextGame++;
+    const size_t i = static_cast<size_t>(gi / 2);
+    const int side = gi % 2;
+    const bool aIsBlack = side == 0;
+    MatchPlayer& black = aIsBlack ? a : b;
+    MatchPlayer& white = aIsBlack ? b : a;
+    s.start(static_cast<int>(i), aIsBlack, black, white, n, komi, moveCap, openings[i], deriveSeed(seed, i * 4 + side * 2 + 0),
+            deriveSeed(seed, i * 4 + side * 2 + 1));
+    return true;
+  };
+  int active = 0;
+  for (MatchSlot& s : slots)
+    if (startNext(s)) ++active;
+  std::vector<MatchSlot*> batchA, batchB;
+  std::vector<NNInput> in;
+  std::vector<NNOutput> out;
+  auto flush = [&](std::vector<MatchSlot*>& batch, NNEvaluator& ev) {
+    if (batch.empty()) return;
+    in.clear();
+    for (MatchSlot* s : batch) in.push_back(s->leaf.input());
+    ev.evaluate(in, out);
+    for (size_t k = 0; k < batch.size(); ++k) batch[k]->treeToMove().commit(batch[k]->leaf, out[k]);
+    batch.clear();
+  };
+  while (active > 0) {
+    for (MatchSlot& s : slots) {
+      while (s.active) {
+        if (s.collect()) {
+          (s.moverIsA() ? batchA : batchB).push_back(&s);
+          break;
+        }
+        // Game over: store it and refill the slot.
+        r.games[static_cast<size_t>(s.pair * 2 + (s.aIsBlack ? 0 : 1))] = s.game;
+        --active;
+        if (startNext(s)) ++active;
+      }
+    }
+    flush(batchA, *a.ev);
+    flush(batchB, *b.ev);
+  }
   std::set<uint64_t> trajectories;
   for (size_t i = 0; i < openings.size(); ++i) {
     float pairScore = 0.0f;
     for (int side = 0; side < 2; ++side) {
-      const bool aIsBlack = side == 0;
-      MatchPlayer& black = aIsBlack ? a : b;
-      MatchPlayer& white = aIsBlack ? b : a;
-      const uint64_t sb = deriveSeed(seed, i * 4 + side * 2 + 0);
-      const uint64_t sw = deriveSeed(seed, i * 4 + side * 2 + 1);
-      MatchGame g = playOne(black, white, n, komi, moveCap, openings[i], sb, sw);
-      g.pair = static_cast<int>(i);
-      g.aIsBlack = aIsBlack;
+      const MatchGame& g = r.games[i * 2 + static_cast<size_t>(side)];
       const float s = g.scoreForA();
       pairScore += s;
       if (s > 0.75f) ++r.winsA;
       else if (s < 0.25f) ++r.lossesA;
       else ++r.drawsA;
       trajectories.insert(trajectoryHash(g.moves));
-      r.games.push_back(std::move(g));
     }
     r.pairScores.push_back(pairScore / 2.0f);
   }
