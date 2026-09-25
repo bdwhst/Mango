@@ -36,10 +36,12 @@ struct SearchConfig {
 
 struct SelfplayConfig {
   int gamesPerIteration = 2000;
-  int gamesInFlight = 128;   // G
+  int gamesInFlight = 128;   // G (the global concurrency, whatever the thread count)
   int leavesPerGame = 1;     // K
   int chunkGames = 256;
   bool saveSgf = true;
+  int threads = 1;           // search threads of the self-play driver (1 = the first-version driver), DESIGN 5.5.1
+  int maxBatch = 0;          // requests per forward of the evaluation thread (<= 0: G), threads > 1 only
 };
 
 struct TrainingConfig {
@@ -64,6 +66,7 @@ struct EvalConfig {
   int openingMoves = 3;
   int ladderEvery = 5;
   bool gating = true;
+  int threads = 1;  // search threads of the match driver (1 = the first-version driver), DESIGN 5.5.1
 };
 
 struct Config {

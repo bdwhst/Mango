@@ -68,9 +68,14 @@ struct MatchReport {
 // Plays every opening twice with colours swapped. Game seeds derive from `seed`.
 // `gamesInFlight` games run concurrently with one evaluator call per side per step
 // (K = 1 per game, DESIGN 5.4.5): the result is identical for every value >= 1 with a
-// deterministic evaluator; 0 means all games at once.
+// deterministic evaluator; 0 means all games at once. `threads` > 1 (DESIGN 5.5.1, M4a)
+// shares the game slots over T search threads with one evaluation thread that owns
+// both evaluators and never mixes the two sides in one forward (`maxBatch` caps the
+// requests it takes per step, <= 0: all in flight); threads == 1 is the first-version
+// driver, unchanged. Under a deterministic evaluator the result does not depend on
+// `threads` or `maxBatch`.
 MatchReport playMatch(MatchPlayer a, MatchPlayer b, int n, float komi, int moveCap, const std::vector<Opening>& openings,
-                      uint64_t seed, int gamesInFlight = 0);
+                      uint64_t seed, int gamesInFlight = 0, int threads = 1, int maxBatch = 0);
 
 // Percentile bootstrap (2.5%, 97.5%) of the mean over `resamples` seeded resamples.
 std::pair<double, double> bootstrapMeanInterval(const std::vector<float>& values, int resamples, uint64_t seed);

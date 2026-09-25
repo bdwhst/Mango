@@ -356,3 +356,161 @@ TEST_CASE("batched self-play handles games that are over before their first move
   }
   CHECK(ev.positions() == static_cast<int>(st.evaluations));
 }
+
+// ---------------------------------------------------------------------------------
+// Multi-threaded driver (DESIGN 5.5.1, M4a): T search threads + 1 evaluation thread.
+// Per game the contract is the batched one: matched by game_seed, every game equals its
+// standalone sequential run. Forwards respect max_batch; rounds are split when it is
+// smaller than a thread's share; the tree invariants hold after every move in every
+// thread; the failure protocol retries once with identical requests and aborts every
+// thread on the second failure.
+#include <map>
+
+#include "search/node.h"
+#include "tests/test_util.h"
+
+TEST_CASE("threaded self-play reproduces every game by seed and caps every forward at max_batch") {
+  const int n = 5;
+  const int total = 13;
+  struct Cfg {
+    int threads, G, maxBatch;
+  };
+  for (const Cfg c : {Cfg{2, 8, 3}, Cfg{5, 8, 0}, Cfg{2, 6, 6}, Cfg{3, 3, 1}}) {
+    for (bool symmetry : {false, true}) {
+      CAPTURE(c.threads);
+      CAPTURE(c.G);
+      CAPTURE(c.maxBatch);
+      CAPTURE(symmetry);
+      FakeEvaluator inner = colorValueEvaluator(n, 0.1f);
+      test::RecordingEvaluator ev(inner);
+      BatchedSelfplay driver(ev, c.G, "m", c.threads, c.maxBatch);
+      CHECK(driver.threads() == c.threads);
+      std::map<uint64_t, GameRecord> bySeed;
+      std::map<uint64_t, int> evalsBySeed;
+      int done = 0;
+      BatchStats st = driver.run(
+          total,
+          [&](int i) {
+            SelfplayGameOptions o = optionsFor(n, 12, 100 + i, symmetry);
+            o.checkInvariants = true;  // throws (and fails the run) on any violation in any thread
+            return o;
+          },
+          [&](int, SelfplayGameResult&& r) {  // serialised by the driver
+            ++done;
+            evalsBySeed[r.record.gameSeed] = r.evaluations;
+            bySeed[r.record.gameSeed] = std::move(r.record);
+          });
+      CHECK(st.games == total);
+      CHECK(done == total);
+      REQUIRE(bySeed.size() == static_cast<size_t>(total));
+      CHECK(st.retries == 0);
+      CHECK(st.batches == static_cast<uint64_t>(ev.calls()));
+      CHECK(st.evaluations == static_cast<uint64_t>(ev.positions()));
+      const int cap = c.maxBatch > 0 ? c.maxBatch : c.G;
+      CHECK(ev.maxBatch() <= cap);
+      if (c.maxBatch > 0 && c.maxBatch < (c.G + c.threads - 1) / c.threads) {
+        // A thread's round (up to ceil(G/T) requests) exceeds the cap: it is split over
+        // several forwards, so the cap is actually reached.
+        CHECK(ev.maxBatch() == c.maxBatch);
+      }
+      uint64_t positions = 0, evaluations = 0;
+      for (int i = 0; i < total; ++i) {
+        const uint64_t seed = 100 + static_cast<uint64_t>(i);
+        FakeEvaluator seq = colorValueEvaluator(n, 0.1f);
+        SelfplayGameResult s = playSelfplayGame(seq, optionsFor(n, 12, seed, symmetry), "m");
+        REQUIRE(bySeed.count(seed) == 1);
+        CHECK_MESSAGE(sameRecord(bySeed[seed], s.record), "game with seed " << seed << " differs from its sequential run");
+        CHECK(evalsBySeed[seed] == s.evaluations);
+        positions += static_cast<uint64_t>(s.record.T());
+        evaluations += static_cast<uint64_t>(s.evaluations);
+      }
+      CHECK(st.positions == positions);
+      CHECK(st.evaluations == evaluations);
+    }
+  }
+}
+
+TEST_CASE("threads = 1 is the first-version driver: identical records and counters") {
+  const int n = 5;
+  std::vector<GameRecord> a(7), b(7);
+  BatchStats sa, sb;
+  {
+    FakeEvaluator ev = colorValueEvaluator(n, 0.1f);
+    BatchedSelfplay driver(ev, 3, "m", /*threads=*/1, /*maxBatch=*/0);
+    sa = driver.run(
+        7, [&](int i) { return optionsFor(n, 10, 700 + i, true); },
+        [&](int i, SelfplayGameResult&& r) { a[static_cast<size_t>(i)] = std::move(r.record); });
+  }
+  {
+    FakeEvaluator ev = colorValueEvaluator(n, 0.1f);
+    BatchedSelfplay driver(ev, 3, "m");  // the M3b constructor
+    sb = driver.run(
+        7, [&](int i) { return optionsFor(n, 10, 700 + i, true); },
+        [&](int i, SelfplayGameResult&& r) { b[static_cast<size_t>(i)] = std::move(r.record); });
+  }
+  for (size_t i = 0; i < a.size(); ++i) CHECK(sameRecord(a[i], b[i]));
+  CHECK(sa.games == sb.games);
+  CHECK(sa.positions == sb.positions);
+  CHECK(sa.evaluations == sb.evaluations);
+  CHECK(sa.batches == sb.batches);
+  CHECK(sa.retries == sb.retries);
+}
+
+TEST_CASE("threaded self-play retries a failed forward with identical requests and aborts on two failures") {
+  const int n = 5;
+  for (bool symmetry : {true, false}) {
+    CAPTURE(symmetry);
+    FakeEvaluator inner(n, 0.0f);
+    test::RecordingEvaluator ev(inner);
+    ev.failAt = {4};  // the 4th forward fails once; the 5th call must be its exact repeat
+    BatchedSelfplay driver(ev, 6, "m", 3, 0);
+    std::map<uint64_t, GameRecord> bySeed;
+    BatchStats st = driver.run(
+        6,
+        [&](int i) {
+          SelfplayGameOptions o = optionsFor(n, 10, 300 + i, symmetry);
+          o.checkInvariants = true;  // no Pending node / reservation may survive the retry
+          return o;
+        },
+        [&](int, SelfplayGameResult&& r) { bySeed[r.record.gameSeed] = std::move(r.record); });
+    CHECK(st.retries == 1);
+    CHECK(st.games == 6);
+    REQUIRE(ev.calls() >= 5);
+    CHECK(ev.sizes()[3] == ev.sizes()[4]);
+    CHECK(ev.planesOfCall(4) == ev.planesOfCall(5));
+    CHECK(st.batches == static_cast<uint64_t>(ev.calls() - 1));  // the failed call is not a batch
+    for (int i = 0; i < 6; ++i) {
+      FakeEvaluator seq(n, 0.0f);
+      SelfplayGameResult s = playSelfplayGame(seq, optionsFor(n, 10, 300 + i, symmetry), "m");
+      CHECK_MESSAGE(sameRecord(bySeed[300 + static_cast<uint64_t>(i)], s.record), "game " << i << " diverged after the retry");
+    }
+  }
+  // Two consecutive failures: every thread exits (run returns), the run throws, no game
+  // of the affected batch is reported, and every node is freed (no thread left a tree
+  // behind).
+  const int64_t liveBefore = Node::liveCount().load();
+  {
+    FakeEvaluator inner(n, 0.0f);
+    test::RecordingEvaluator ev(inner);
+    ev.failAt = {3, 4};
+    BatchedSelfplay driver(ev, 6, "m", 3, 4);
+    int done = 0;
+    CHECK_THROWS_AS(driver.run(6, [&](int i) { return optionsFor(n, 10, 400 + i, false); },
+                               [&](int, SelfplayGameResult&&) { ++done; }),
+                    std::runtime_error);
+    CHECK(done == 0);
+    CHECK(ev.calls() == 4);
+  }
+  CHECK(Node::liveCount().load() == liveBefore);
+  // An error raised inside a search thread (a throwing chunk writer stands in for one)
+  // also stops every thread and propagates.
+  {
+    FakeEvaluator ev(n, 0.0f);
+    BatchedSelfplay driver(ev, 4, "m", 2, 0);
+    CHECK_THROWS_AS(driver.run(
+                        8, [&](int i) { return optionsFor(n, 6, 500 + i, false); },
+                        [&](int, SelfplayGameResult&&) { throw std::invalid_argument("writer failed"); }),
+                    std::invalid_argument);
+  }
+  CHECK(Node::liveCount().load() == liveBefore);
+}

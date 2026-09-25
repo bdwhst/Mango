@@ -1,10 +1,13 @@
 #include "match/match.h"
 
 #include <algorithm>
+#include <exception>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <sstream>
+#include <thread>
 
 #include "core/board.h"
 #include "core/history.h"
@@ -12,6 +15,7 @@
 #include "core/zobrist.h"
 #include "nlohmann/json.hpp"
 #include "search/mcts.h"
+#include "selfplay/eval_queue.h"
 
 namespace mango {
 
@@ -224,32 +228,29 @@ std::pair<double, double> bootstrapMeanInterval(const std::vector<float>& values
   return {pct(0.025), pct(0.975)};
 }
 
-MatchReport playMatch(MatchPlayer a, MatchPlayer b, int n, float komi, int moveCap, const std::vector<Opening>& openings,
-                      uint64_t seed, int gamesInFlight) {
-  MatchReport r;
-  r.nameA = a.name;
-  r.nameB = b.name;
-  r.boardSize = n;
-  r.komi = komi;
-  r.simulations = a.random ? b.params.simulations : a.params.simulations;
-  if (a.random && b.random && !openings.empty()) r.simulations = 0;
-  r.seed = seed;
-  r.openings = openings;
-  const int totalGames = static_cast<int>(openings.size()) * 2;
-  r.games.resize(static_cast<size_t>(totalGames));
-  const int G = gamesInFlight <= 0 ? std::max(1, totalGames) : std::min(gamesInFlight, std::max(1, totalGames));
+namespace {
+
+// Starts game `gi` (opening gi/2, A black when gi is even) in the slot.
+void startMatchGame(MatchSlot& s, int gi, MatchPlayer& a, MatchPlayer& b, int n, float komi, int moveCap,
+                    const std::vector<Opening>& openings, uint64_t seed) {
+  const size_t i = static_cast<size_t>(gi / 2);
+  const int side = gi % 2;
+  const bool aIsBlack = side == 0;
+  MatchPlayer& black = aIsBlack ? a : b;
+  MatchPlayer& white = aIsBlack ? b : a;
+  s.start(static_cast<int>(i), aIsBlack, black, white, n, komi, moveCap, openings[i], deriveSeed(seed, i * 4 + side * 2 + 0),
+          deriveSeed(seed, i * 4 + side * 2 + 1));
+}
+
+// The first-version match driver (M3b): one thread, one evaluator call per side per step.
+void playMatchSingleThread(MatchReport& r, MatchPlayer& a, MatchPlayer& b, int n, float komi, int moveCap,
+                           const std::vector<Opening>& openings, uint64_t seed, int G) {
+  const int totalGames = static_cast<int>(r.games.size());
   std::vector<MatchSlot> slots(static_cast<size_t>(G));
   int nextGame = 0;
   auto startNext = [&](MatchSlot& s) {
     if (nextGame >= totalGames) return false;
-    const int gi = nextGame++;
-    const size_t i = static_cast<size_t>(gi / 2);
-    const int side = gi % 2;
-    const bool aIsBlack = side == 0;
-    MatchPlayer& black = aIsBlack ? a : b;
-    MatchPlayer& white = aIsBlack ? b : a;
-    s.start(static_cast<int>(i), aIsBlack, black, white, n, komi, moveCap, openings[i], deriveSeed(seed, i * 4 + side * 2 + 0),
-            deriveSeed(seed, i * 4 + side * 2 + 1));
+    startMatchGame(s, nextGame++, a, b, n, komi, moveCap, openings, seed);
     return true;
   };
   int active = 0;
@@ -283,6 +284,137 @@ MatchReport playMatch(MatchPlayer a, MatchPlayer b, int n, float komi, int moveC
     flush(batchA, a.ev);
     flush(batchB, b.ev);
   }
+}
+
+// The M4a match driver (DESIGN 5.5.1): T search threads over the G slots (thread t owns
+// slots t, t+T, ...), one evaluation thread that owns both evaluators and runs one
+// forward per side and step — a request of A is never in a forward of B. Per game the
+// slot's collect() is the first-version one, so results are independent of T.
+void playMatchThreaded(MatchReport& r, MatchPlayer& a, MatchPlayer& b, int n, float komi, int moveCap,
+                       const std::vector<Opening>& openings, uint64_t seed, int G, int T, int maxBatch) {
+  const int totalGames = static_cast<int>(r.games.size());
+  std::vector<MatchSlot> slots(static_cast<size_t>(G));
+  EvalQueue queue(T, maxBatch <= 0 ? G : maxBatch);
+  std::mutex startMutex;
+  int nextGame = 0;
+  auto startNext = [&](MatchSlot& s) {
+    std::lock_guard<std::mutex> lk(startMutex);
+    if (nextGame >= totalGames) return false;
+    startMatchGame(s, nextGame++, a, b, n, komi, moveCap, openings, seed);
+    return true;
+  };
+  std::mutex errorMutex;
+  std::exception_ptr error;
+  auto fail = [&](std::exception_ptr e) {
+    {
+      std::lock_guard<std::mutex> lk(errorMutex);
+      if (!error) error = std::move(e);
+    }
+    queue.abort();
+  };
+
+  auto searchThread = [&](int t) {
+    std::vector<MatchSlot*> mine;
+    for (int i = t; i < G; i += T) mine.push_back(&slots[static_cast<size_t>(i)]);
+    std::vector<NNOutput> outs(mine.size());
+    std::vector<EvalRequest> round;
+    std::vector<std::pair<MatchSlot*, NNOutput*>> pending;
+    auto abandon = [&] {
+      for (auto& [s, o] : pending) s->treeToMove().abort(s->leaf);
+      pending.clear();
+    };
+    try {
+      int active = 0;
+      for (MatchSlot* s : mine)
+        if (startNext(*s)) ++active;
+      while (active > 0 && !queue.aborted()) {
+        round.clear();
+        pending.clear();
+        for (size_t k = 0; k < mine.size(); ++k) {
+          MatchSlot& s = *mine[k];
+          while (s.active) {
+            if (s.collect()) {
+              round.push_back(EvalRequest{s.leaf.planes.data(), &outs[k], t, s.moverIsA() ? 0 : 1});
+              pending.emplace_back(&s, &outs[k]);
+              break;
+            }
+            r.games[static_cast<size_t>(s.pair * 2 + (s.aIsBlack ? 0 : 1))] = s.game;  // distinct index per game
+            --active;
+            if (startNext(s)) ++active;
+          }
+        }
+        if (round.empty()) continue;
+        if (!queue.submitRound(t, round)) {
+          abandon();
+          return;
+        }
+        for (auto& [s, o] : pending) s->treeToMove().commit(s->leaf, *o);
+        pending.clear();
+      }
+    } catch (...) {
+      fail(std::current_exception());
+      abandon();
+    }
+  };
+
+  EvalThreadStats evalStats;
+  auto evaluationThread = [&] {
+    std::vector<EvalRequest> batch;
+    std::vector<size_t> bucket;
+    std::vector<NNInput> in;
+    std::vector<NNOutput> out;
+    try {
+      while (queue.takeBatch(batch)) {
+        for (int side = 0; side < 2; ++side) {
+          bucket.clear();
+          for (size_t i = 0; i < batch.size(); ++i)
+            if (batch[i].side == side) bucket.push_back(i);
+          if (bucket.empty()) continue;
+          NNEvaluator* ev = side == 0 ? a.ev : b.ev;
+          if (ev == nullptr) throw std::logic_error("a random player has no pending leaves");
+          in.clear();
+          for (size_t i : bucket) in.push_back(NNInput{batch[i].planes});
+          evaluateWithRetry(*ev, in, out, evalStats);
+          for (size_t k = 0; k < bucket.size(); ++k) *batch[bucket[k]].out = std::move(out[k]);
+          evalStats.batches += 1;
+          evalStats.evaluations += static_cast<uint64_t>(bucket.size());
+        }
+        queue.deliver(batch);
+      }
+    } catch (...) {
+      fail(std::current_exception());
+    }
+  };
+
+  std::thread evaluator(evaluationThread);
+  std::vector<std::thread> workers;
+  workers.reserve(static_cast<size_t>(T));
+  for (int t = 0; t < T; ++t) workers.emplace_back(searchThread, t);
+  for (std::thread& w : workers) w.join();
+  queue.stop();
+  evaluator.join();
+  if (error) std::rethrow_exception(error);
+}
+
+}  // namespace
+
+MatchReport playMatch(MatchPlayer a, MatchPlayer b, int n, float komi, int moveCap, const std::vector<Opening>& openings,
+                      uint64_t seed, int gamesInFlight, int threads, int maxBatch) {
+  MatchReport r;
+  r.nameA = a.name;
+  r.nameB = b.name;
+  r.boardSize = n;
+  r.komi = komi;
+  r.simulations = a.random ? b.params.simulations : a.params.simulations;
+  if (a.random && b.random && !openings.empty()) r.simulations = 0;
+  r.seed = seed;
+  r.openings = openings;
+  const int totalGames = static_cast<int>(openings.size()) * 2;
+  r.games.resize(static_cast<size_t>(totalGames));
+  const int G = gamesInFlight <= 0 ? std::max(1, totalGames) : std::min(gamesInFlight, std::max(1, totalGames));
+  const int T = std::max(1, std::min(threads, G));
+  if (T == 1) playMatchSingleThread(r, a, b, n, komi, moveCap, openings, seed, G);
+  else playMatchThreaded(r, a, b, n, komi, moveCap, openings, seed, G, T, maxBatch);
   std::set<uint64_t> trajectories;
   for (size_t i = 0; i < openings.size(); ++i) {
     float pairScore = 0.0f;

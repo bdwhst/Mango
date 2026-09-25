@@ -42,6 +42,8 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "save_sgf": True,
         "evict_old_chunks": True,  # delete chunks that fell out of the window (DESIGN 6.3)
         "processes": 1,  # N >= 2: N mango_selfplay processes per iteration, each with games_in_flight (DESIGN 5.5.1 step 0)
+        "threads": 1,  # search threads of mango_selfplay (1 = the first-version driver), DESIGN 5.5.1
+        "max_batch": 0,  # requests per forward of its evaluation thread (0 = games_in_flight), threads > 1 only
     },
     "training": {
         "res_blocks": 6,
@@ -70,6 +72,7 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "gtp_anchor": None,       # ladder GTP anchor played by the pipeline; keep None: GNU Go is measured on
                                   # demand by scripts/vs_gnugo.py (DESIGN 6.6), never during training
         "gtp_workers": 4,         # parallel engine trios for a GTP match (scripts/vs_gnugo.py; games sequential per trio)
+        "threads": 1,  # search threads of mango_match (1 = the first-version driver), DESIGN 5.5.1
     },
 }
 

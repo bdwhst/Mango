@@ -2,6 +2,8 @@
 //   mango_selfplay --model DIR --config CFG --games N --out DIR [--chunk-prefix P]
 //                  [--chunk-id-start K] [--seed S] [--sgf-dir DIR] [--device D] [--fp32]
 //                  [--iteration I] [--games-in-flight G] [--resign-threshold T]
+//                  [--threads T] [--max-batch B]
+// --threads / --max-batch override selfplay.threads / selfplay.max_batch (DESIGN 5.5.1).
 // --resign-threshold overrides search.resign_threshold (the pipeline passes the value
 // selected per iteration, DESIGN 5.4.7; -1 disables resignation).
 // Publishes chunks of config selfplay.chunk_games games (atomic rename) and prints a
@@ -28,7 +30,7 @@ namespace fs = std::filesystem;
 
 int main(int argc, char** argv) {
   std::string model, configPath, outDir, sgfDir, device = "auto", chunkPrefix = "chunk_";
-  int games = -1, iteration = 0, gamesInFlight = -1;
+  int games = -1, iteration = 0, gamesInFlight = -1, threads = -1, maxBatch = -1;
   uint64_t chunkIdStart = 0, seed = 1;
   bool fp32 = false;
   bool haveResign = false;
@@ -53,6 +55,8 @@ int main(int argc, char** argv) {
     else if (a == "--device") device = next();
     else if (a == "--iteration") iteration = std::atoi(next().c_str());
     else if (a == "--games-in-flight") gamesInFlight = std::atoi(next().c_str());
+    else if (a == "--threads") threads = std::atoi(next().c_str());
+    else if (a == "--max-batch") maxBatch = std::atoi(next().c_str());
     else if (a == "--resign-threshold") {
       resignThreshold = std::strtof(next().c_str(), nullptr);
       haveResign = true;
@@ -82,6 +86,8 @@ int main(int argc, char** argv) {
     fs::create_directories(outDir);
     if (!sgfDir.empty()) fs::create_directories(sgfDir);
     const int G = gamesInFlight > 0 ? gamesInFlight : cfg.selfplay.gamesInFlight;
+    const int T = threads > 0 ? threads : cfg.selfplay.threads;
+    const int B = maxBatch >= 0 ? maxBatch : cfg.selfplay.maxBatch;
 
     mango::ChunkHeader header;
     header.boardSize = cfg.board.size;
@@ -101,7 +107,8 @@ int main(int argc, char** argv) {
     base.params = mango::SearchParams::fromConfig(cfg.search, cfg.board.size, /*selfplay=*/true);
 
     std::cerr << "mango_selfplay: model " << ev.modelId() << " on " << ev.deviceName() << (ev.isHalf() ? " (fp16)" : " (fp32)")
-              << ", " << base.params.simulations << " sims/move, " << games << " games, " << G << " in flight, resign "
+              << ", " << base.params.simulations << " sims/move, " << games << " games, " << G << " in flight, " << T
+              << " search thread(s), max batch " << (B <= 0 ? G : B) << ", resign "
               << (base.params.resignThreshold <= -1.0f ? std::string("off") : std::to_string(base.params.resignThreshold))
               << "\n";
 
@@ -148,7 +155,7 @@ int main(int argc, char** argv) {
         ++chunkId;
       }
     };
-    mango::BatchedSelfplay driver(ev, G, ev.modelId());
+    mango::BatchedSelfplay driver(ev, G, ev.modelId(), T, B);
     const mango::BatchStats st = driver.run(games, makeOptions, onDone);
     if (writer) {  // cannot happen (closed on the last game), kept for safety
       published.push_back(writer->close());
@@ -167,6 +174,8 @@ int main(int argc, char** argv) {
     summary["evals_per_s"] = st.seconds > 0 ? static_cast<double>(st.evaluations) / st.seconds : 0.0;
     summary["positions_per_s"] = st.seconds > 0 ? static_cast<double>(st.positions) / st.seconds : 0.0;
     summary["games_in_flight"] = G;
+    summary["threads"] = driver.threads();
+    summary["max_batch"] = B <= 0 ? G : B;
     summary["avg_game_length"] = st.games ? static_cast<double>(st.positions) / st.games : 0.0;
     summary["black_wins"] = blackWins;
     summary["terminations"] = {{"two_passes", terminations[0]}, {"resign", terminations[1]}, {"move_cap", terminations[2]}};

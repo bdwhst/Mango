@@ -1,7 +1,7 @@
 // mango_match: colour-swapped pairs between two model directories (DESIGN 5.8).
 //   mango_match --a DIR|random --b DIR|random --config CFG --pairs N [--sims S] [--seed S]
 //               [--openings K] [--openings-file F] [--out report.json] [--device D] [--fp32]
-//               [--games-in-flight G]
+//               [--games-in-flight G] [--threads T] [--max-batch B]
 //   mango_match --write-openings F --config CFG --pairs N [--openings K] [--seed S]
 // "random" is the ladder's uniform-random legal-move anchor (DESIGN 6.6). With
 // --openings-file the opening set is read from F (written by --write-openings or taken
@@ -22,7 +22,7 @@
 
 int main(int argc, char** argv) {
   std::string a, b, configPath, outPath, openingsFile, writeOpenings, device = "auto";
-  int pairs = -1, sims = -1, openingMoves = -1, gamesInFlight = 32;
+  int pairs = -1, sims = -1, openingMoves = -1, gamesInFlight = 32, threads = -1, maxBatch = 0;
   uint64_t seed = 1;
   bool fp32 = false;
   for (int i = 1; i < argc; ++i) {
@@ -45,6 +45,8 @@ int main(int argc, char** argv) {
     else if (arg == "--openings-file") openingsFile = next();
     else if (arg == "--write-openings") writeOpenings = next();
     else if (arg == "--games-in-flight") gamesInFlight = std::atoi(next().c_str());
+    else if (arg == "--threads") threads = std::atoi(next().c_str());
+    else if (arg == "--max-batch") maxBatch = std::atoi(next().c_str());
     else if (arg == "--device") device = next();
     else if (arg == "--fp32") fp32 = true;
     else {
@@ -114,9 +116,12 @@ int main(int argc, char** argv) {
       return 1;
     }
 #endif
+    const int T = threads > 0 ? threads : cfg.eval.threads;
     std::cerr << "mango_match: " << pa.name << " vs " << pb.name << ", " << openings.size() << " pairs, "
-              << evalParams.simulations << " sims/move on " << deviceName << "\n";
-    mango::MatchReport r = mango::playMatch(pa, pb, n, cfg.board.komi, cfg.board.effectiveMoveCap(), openings, seed, gamesInFlight);
+              << evalParams.simulations << " sims/move on " << deviceName << ", " << gamesInFlight << " in flight, " << T
+              << " search thread(s)\n";
+    mango::MatchReport r = mango::playMatch(pa, pb, n, cfg.board.komi, cfg.board.effectiveMoveCap(), openings, seed, gamesInFlight,
+                                            T, maxBatch);
     const std::string json = mango::matchReportToJson(r);
     if (!outPath.empty()) {
       std::ofstream f(outPath + ".tmp");

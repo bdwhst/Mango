@@ -263,3 +263,65 @@ TEST_CASE("a score-aware player beats a passive one from both colours") {
   CHECK(rev.meanPairScore == doctest::Approx(0.0));
   CHECK(rev.winsA == 0);
 }
+
+// ---------------------------------------------------------------------------------
+// Multi-threaded match driver (DESIGN 5.5.1, M4a): results identical for every thread
+// count and batch cap, the two sides never share a forward, every forward respects the cap.
+#include "tests/test_util.h"
+
+TEST_CASE("threaded match equals the single-threaded match and keeps the sides apart") {
+  const int n = 5;
+  // Side-specific evaluators: mixing a request of A into a forward of B (or vice versa)
+  // would change the result.
+  FakeEvaluator innerA(n, [n](const uint8_t* planes, float* policy, float* value) {
+    for (int a = 0; a <= n * n; ++a) policy[a] = 1.0f + static_cast<float>(a % 3);
+    *value = blackToMove(planes, n) ? 0.3f : -0.3f;
+  });
+  FakeEvaluator innerB = scoreAwareEvaluator(n, 7.5f);
+  test::RecordingEvaluator evA(innerA), evB(innerB);
+  MatchPlayer a{&evA, evalParams(8), "A"};
+  MatchPlayer b{&evB, evalParams(8), "B"};
+  auto openings = generateRandomOpenings(n, 7.5f, 50, 6, 2, 21);
+  MatchReport ref = playMatch(a, b, n, 7.5f, 50, openings, 5, /*gamesInFlight=*/4, /*threads=*/1);
+  CHECK(evA.calls() > 0);
+  CHECK(evB.calls() > 0);
+  struct Cfg {
+    int G, threads, maxBatch;
+  };
+  for (const Cfg c : {Cfg{4, 4, 0}, Cfg{12, 3, 5}, Cfg{6, 2, 1}, Cfg{5, 8, 0}}) {
+    CAPTURE(c.G);
+    CAPTURE(c.threads);
+    CAPTURE(c.maxBatch);
+    const int beforeA = evA.calls(), beforeB = evB.calls();
+    MatchReport r = playMatch(a, b, n, 7.5f, 50, openings, 5, c.G, c.threads, c.maxBatch);
+    CHECK(r.pairScores == ref.pairScores);
+    CHECK(r.meanPairScore == ref.meanPairScore);
+    REQUIRE(r.games.size() == ref.games.size());
+    for (size_t i = 0; i < r.games.size(); ++i) {
+      CHECK(r.games[i].moves == ref.games[i].moves);
+      CHECK(r.games[i].result == ref.games[i].result);
+      CHECK(r.games[i].pair == ref.games[i].pair);
+      CHECK(r.games[i].aIsBlack == ref.games[i].aIsBlack);
+    }
+    CHECK(evA.calls() > beforeA);
+    CHECK(evB.calls() > beforeB);
+    const int cap = c.maxBatch > 0 ? c.maxBatch : std::min(c.G, static_cast<int>(openings.size()) * 2);
+    for (size_t k = static_cast<size_t>(beforeA); k < evA.sizes().size(); ++k) CHECK(evA.sizes()[k] <= cap);
+    for (size_t k = static_cast<size_t>(beforeB); k < evB.sizes().size(); ++k) CHECK(evB.sizes()[k] <= cap);
+  }
+  // A random side has no requests; the threaded driver handles it like the first version.
+  MatchPlayer rnd{nullptr, evalParams(8), "random", true};
+  MatchReport r1 = playMatch(a, rnd, n, 7.5f, 50, openings, 9, 4, 1);
+  MatchReport r4 = playMatch(a, rnd, n, 7.5f, 50, openings, 9, 4, 4, 2);
+  CHECK(r1.pairScores == r4.pairScores);
+  for (size_t i = 0; i < r1.games.size(); ++i) CHECK(r1.games[i].moves == r4.games[i].moves);
+  MatchReport rr = playMatch(rnd, rnd, n, 7.5f, 50, openings, 9, 4, 3);
+  CHECK(rr.games.size() == openings.size() * 2);
+  // One failure of a side's forward is retried (same result); two in a row abort the match.
+  evB.failAt = {evB.calls() + 2};
+  MatchReport retried = playMatch(a, b, n, 7.5f, 50, openings, 5, 6, 3, 0);
+  CHECK(retried.pairScores == ref.pairScores);
+  evB.failAt = {evB.calls() + 2, evB.calls() + 3};
+  CHECK_THROWS_AS(playMatch(a, b, n, 7.5f, 50, openings, 5, 6, 3, 0), std::runtime_error);
+  evB.failAt.clear();
+}

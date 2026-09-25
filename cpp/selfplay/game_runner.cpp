@@ -1,5 +1,7 @@
 #include "selfplay/game_runner.h"
 
+#include <stdexcept>
+
 #include <vector>
 
 #include "core/random.h"
@@ -55,6 +57,10 @@ void SelfplayGame::snapshot() {
 
 bool SelfplayGame::finishMove() {
   if (finished_) return true;
+  if (opt_.checkInvariants) {
+    const std::string bad = tree_->checkInvariants();
+    if (!bad.empty()) throw std::logic_error("tree invariants violated: " + bad);
+  }
   const int nn = board_.numPoints();
   const float v = tree_->rootValue();
   const float maxQ = tree_->rootMaxQ();

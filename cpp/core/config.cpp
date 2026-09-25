@@ -53,6 +53,8 @@ Config Config::fromJsonText(const std::string& text) {
     get(s, "leaves_per_game", c.selfplay.leavesPerGame);
     get(s, "chunk_games", c.selfplay.chunkGames);
     get(s, "save_sgf", c.selfplay.saveSgf);
+    get(s, "threads", c.selfplay.threads);
+    get(s, "max_batch", c.selfplay.maxBatch);
   }
   if (j.contains("training")) {
     const json& t = j["training"];
@@ -77,6 +79,7 @@ Config Config::fromJsonText(const std::string& text) {
     get(e, "opening_moves", c.eval.openingMoves);
     get(e, "ladder_every", c.eval.ladderEvery);
     get(e, "gating", c.eval.gating);
+    get(e, "threads", c.eval.threads);
   }
   if (c.board.size < 2 || c.board.size > 19) throw std::invalid_argument("board.size must be in [2, 19]");
   return c;
@@ -111,7 +114,9 @@ std::string Config::toJsonText() const {
                    {"games_in_flight", selfplay.gamesInFlight},
                    {"leaves_per_game", selfplay.leavesPerGame},
                    {"chunk_games", selfplay.chunkGames},
-                   {"save_sgf", selfplay.saveSgf}};
+                   {"save_sgf", selfplay.saveSgf},
+                   {"threads", selfplay.threads},
+                   {"max_batch", selfplay.maxBatch}};
   j["training"] = {{"res_blocks", training.resBlocks},
                    {"filters", training.filters},
                    {"batch_size", training.batchSize},
@@ -129,7 +134,8 @@ std::string Config::toJsonText() const {
                {"gate_threshold", eval.gateThreshold},
                {"opening_moves", eval.openingMoves},
                {"ladder_every", eval.ladderEvery},
-               {"gating", eval.gating}};
+               {"gating", eval.gating},
+               {"threads", eval.threads}};
   return j.dump(2);
 }
 

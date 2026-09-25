@@ -28,6 +28,9 @@ struct SelfplayGameOptions {
   bool noResignGame = false;  // play out even if resignation is enabled
   bool storeFinalOwnership = false;  // record_extras bit 0
   bool storeSearchKind = false;      // record_extras bit 1 (always 1 in this driver: full searches)
+  // Tests only: verify the tree invariants (no Pending node, no virtual loss,
+  // visitCount == 1 + sum N) at the end of every move; a violation throws.
+  bool checkInvariants = false;
 };
 
 struct SelfplayGameResult {
