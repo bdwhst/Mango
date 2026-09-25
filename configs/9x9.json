@@ -16,7 +16,7 @@
     "resign_fpr_target": 0.05,
     "no_resign_fraction": 0.10
   },
-  "selfplay": {"games_per_iteration": 2000, "games_in_flight": 128, "leaves_per_game": 1, "chunk_games": 256, "save_sgf": true},
+  "selfplay": {"games_per_iteration": 2000, "games_in_flight": 1024, "leaves_per_game": 1, "chunk_games": 256, "save_sgf": true, "processes": 1, "threads": 8, "max_batch": 0},
   "training": {
     "res_blocks": 6,
     "filters": 64,
@@ -33,5 +33,5 @@
     "fixed_holdout_iteration": 5
   },
   "eval": {"pairs": 200, "gate_threshold": 0.55, "opening_moves": 3, "ladder_every": 5, "gating": true,
-           "ladder_pairs": 50, "ladder_neighbours": 3, "gtp_workers": 4}
+           "ladder_pairs": 50, "ladder_neighbours": 3, "gtp_workers": 4, "threads": 4}
 }
