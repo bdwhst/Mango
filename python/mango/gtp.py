@@ -85,6 +85,10 @@ class GtpClient:
         except subprocess.TimeoutExpired:
             self.proc.kill()
 
+            self.proc.wait()
+        for pipe in (self.proc.stdin, self.proc.stdout):
+            if pipe is not None:
+                pipe.close()
     def __enter__(self) -> "GtpClient":
         return self
 
