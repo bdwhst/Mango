@@ -2,7 +2,8 @@
 
 Keys the C++ side does not read (it ignores unknown keys): search.resign_auto,
 search.resign_select_scope, search.resign_fpr_target, selfplay.evict_old_chunks,
-training.fixed_holdout_iteration, eval.ladder_pairs, eval.ladder_neighbours, eval.gtp_anchor, eval.gtp_workers.
+training.fixed_holdout_iteration, eval.ladder_pairs, eval.ladder_neighbours, eval.gtp_anchor, eval.gtp_workers,
+selfplay.processes.
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "chunk_games": 256,
         "save_sgf": True,
         "evict_old_chunks": True,  # delete chunks that fell out of the window (DESIGN 6.3)
+        "processes": 1,  # N >= 2: N mango_selfplay processes per iteration, each with games_in_flight (DESIGN 5.5.1 step 0)
     },
     "training": {
         "res_blocks": 6,

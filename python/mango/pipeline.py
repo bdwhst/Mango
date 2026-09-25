@@ -10,7 +10,9 @@ state.json is rewritten atomically before a phase starts (with the phase's plan)
 when it ends; every phase reconciles its outputs against the plan on restart. With
 search.resign_auto the self-play plan carries the v_resign selected from the window's
 no-resign games (DESIGN 5.4.7); the strength phase adds every promoted model and every
-eval.ladder_every-th candidate to the frozen ladder (DESIGN 6.6).
+eval.ladder_every-th candidate to the frozen ladder (DESIGN 6.6). With selfplay.processes
+>= 2 an iteration's games are split over N mango_selfplay processes from per-worker plan
+records persisted before launch (DESIGN 5.5.1 step 0); N = 1 is the single-process path.
 
     python -m mango.pipeline --run runs/smoke --config configs/5x5-smoke.json \
         --bin build/windows-cuda/Release --iterations 30 [--device cuda] [--check]
@@ -25,6 +27,7 @@ import platform
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -53,6 +56,91 @@ def pick_device(name: str | None) -> torch.device:
     if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def split_selfplay_workers(target_games: int, processes: int, chunk_id_start: int, seed: int) -> list[dict[str, Any]]:
+    """Per-worker records of a multi-process self-play plan (DESIGN 5.5.1 step 0): worker k
+    plays `games` games with seed derive_seed(iteration seed, k) and chunk ids in
+    [chunk_id_start, chunk_id_end), one id per game (chunks hold >= 1 game). Persisted
+    before any process starts; a restart never re-splits."""
+    if processes < 2:
+        raise ValueError("a worker plan needs at least two processes")
+    base, extra = divmod(int(target_games), processes)
+    workers: list[dict[str, Any]] = []
+    next_id = int(chunk_id_start)
+    for k in range(processes):
+        games = base + (1 if k < extra else 0)
+        workers.append({"k": k, "games": games, "seed": derive_seed(seed, k), "chunk_id_start": next_id,
+                        "chunk_id_end": next_id + games})
+        next_id += games
+    return workers
+
+
+# Summary fields that describe one launch of the driver(s) and cannot be rebuilt for the
+# launches a restart interrupted (DESIGN 5.5.1 step 0: listed under `incomplete`).
+LAUNCH_ONLY_FIELDS = ("seconds", "evaluations", "batches", "avg_batch", "retries", "eval_seconds", "evals_per_s",
+                      "positions_per_s", "games_in_flight", "workers")
+
+TERMINATION_NAMES = {0: "two_passes", 1: "resign", 2: "move_cap"}
+
+
+def selfplay_counts_from_chunks(paths: list[Path]) -> dict[str, Any]:
+    """The per-iteration counts the driver summary reports, rebuilt from the published
+    chunks (every game record carries its result and termination)."""
+    games = positions = black_wins = 0
+    terminations = {name: 0 for name in TERMINATION_NAMES.values()}
+    for p in sorted(paths):
+        chunk = read_chunk(p)
+        games += chunk.header.num_games
+        positions += chunk.header.num_positions
+        for g in chunk.games:
+            black_wins += 1 if g.result > 0 else 0
+            name = TERMINATION_NAMES.get(int(g.termination), str(int(g.termination)))
+            terminations[name] = terminations.get(name, 0) + 1
+    return {"games": games, "positions": positions, "black_wins": black_wins, "terminations": terminations,
+            "avg_game_length": round(positions / games, 2) if games else 0.0, "chunks": [p.name for p in sorted(paths)]}
+
+
+def merge_selfplay_summaries(summaries: dict[int, dict[str, Any]], seconds: float, processes: int) -> dict[str, Any]:
+    """One summary for the phase from the per-worker mango_selfplay summaries: counts summed,
+    `seconds` the wall time of the phase, rates from those, `games_in_flight` the total
+    concurrency N*G (DESIGN 5.5.1)."""
+    parts = [summaries[k] for k in sorted(summaries)]
+
+    def total(key: str) -> int:
+        return sum(int(s.get(key, 0)) for s in parts)
+
+    terminations: dict[str, int] = {}
+    for s in parts:
+        for name, count in s.get("terminations", {}).items():
+            terminations[name] = terminations.get(name, 0) + int(count)
+    games, positions, evaluations, batches = total("games"), total("positions"), total("evaluations"), total("batches")
+    merged: dict[str, Any] = {
+        "games": games,
+        "positions": positions,
+        "evaluations": evaluations,
+        "batches": batches,
+        "avg_batch": round(evaluations / batches, 2) if batches else 0.0,
+        "retries": total("retries"),
+        "seconds": round(seconds, 1),
+        "eval_seconds": round(sum(float(s.get("eval_seconds", 0.0)) for s in parts), 1),
+        "evals_per_s": round(evaluations / seconds, 1) if seconds > 0 else 0.0,
+        "positions_per_s": round(positions / seconds, 1) if seconds > 0 else 0.0,
+        "games_in_flight": total("games_in_flight"),
+        "processes": processes,
+        "avg_game_length": round(positions / games, 2) if games else 0.0,
+        "black_wins": total("black_wins"),
+        "terminations": terminations,
+        "chunks": [c for s in parts for c in s.get("chunks", [])],
+        "next_chunk_id": max(int(s.get("next_chunk_id", 0)) for s in parts),
+        "workers": [{"k": k, "games": int(summaries[k].get("games", 0)), "positions": int(summaries[k].get("positions", 0)),
+                     "seconds": summaries[k].get("seconds"), "positions_per_s": summaries[k].get("positions_per_s")}
+                    for k in sorted(summaries)],
+    }
+    for key in ("resign_threshold", "model_id", "device", "iteration"):
+        if key in parts[0]:
+            merged[key] = parts[0][key]
+    return merged
 
 
 class Pipeline:
@@ -111,6 +199,65 @@ class Pipeline:
         if proc.returncode != 0:
             raise RuntimeError(f"{args[0]} failed with exit code {proc.returncode}; see logs/{log_name}")
         return proc.stdout
+
+    def _run_workers(self, launches: list[tuple[int, list[Any]]], log_prefix: str) -> dict[int, str]:
+        """Runs the commands concurrently (stderr to logs/<prefix>_<k>.log) and returns their
+        stdout by k. If one exits non-zero the others are terminated, then RuntimeError.
+        Whatever interrupts the launch or the wait (a failed Popen, KeyboardInterrupt) leaves
+        no worker behind: every started process is terminated and waited for, every log
+        handle closed."""
+        procs: dict[int, subprocess.Popen[str]] = {}
+        outputs: dict[int, str] = {}
+        logs = []
+        readers: list[threading.Thread] = []
+        failed: tuple[int, int] | None = None
+        try:
+            for k, args in launches:
+                self.log(f"exec [worker {k}] " + " ".join(str(a) for a in args))
+                errlog = open(self.run / "logs" / f"{log_prefix}_{k}.log", "a", encoding="utf-8")
+                logs.append(errlog)
+                procs[k] = subprocess.Popen([str(a) for a in args], stdout=subprocess.PIPE, stderr=errlog, text=True)
+
+            def read(k: int) -> None:
+                outputs[k] = procs[k].stdout.read()  # type: ignore[union-attr]
+
+            readers = [threading.Thread(target=read, args=(k,), daemon=True) for k in procs]
+            for t in readers:
+                t.start()
+            running = set(procs)
+            while running:
+                for k in sorted(running):
+                    rc = procs[k].poll()
+                    if rc is None:
+                        continue
+                    running.discard(k)
+                    if rc != 0 and failed is None:
+                        failed = (k, rc)
+                        self.log(f"worker {k} failed with exit code {rc}; terminating {len(running)} running worker(s)")
+                        for j in running:
+                            procs[j].terminate()
+                if running:
+                    time.sleep(0.1)
+        finally:
+            for p in procs.values():
+                if p.poll() is None:
+                    p.terminate()
+            for p in procs.values():
+                if p.poll() is None:
+                    try:
+                        p.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        p.kill()
+                        p.wait()
+            for t in readers:
+                t.join()
+            for errlog in logs:
+                errlog.close()
+        if failed is not None:
+            raise RuntimeError(f"{launches[0][1][0]} worker {failed[0]} failed with exit code {failed[1]}; see "
+                               f"logs/{log_prefix}_{failed[0]}.log (the other workers were terminated; restart resumes "
+                               f"every worker from the plan)")
+        return outputs
 
     # --- initialisation --------------------------------------------------------------------
 
@@ -258,7 +405,7 @@ class Pipeline:
                          f"(false-positive rate {rate if rate is None else f'{rate:.3f}'}, {resign['no_resign_games']} tagged)")
         else:
             resign, v_resign = None, None
-        plan = self._begin("selfplay", {
+        new_plan = {
             "task_id": str(it),
             "model_id": self.state["best_model_id"],
             "target_games": int(self.cfg["selfplay"]["games_per_iteration"]),
@@ -267,7 +414,14 @@ class Pipeline:
             "seed": derive_seed(self.state["run_seed"], it),
             "v_resign": v_resign,
             "resign_selection": resign,
-        })
+        }
+        processes = int(self.cfg["selfplay"].get("processes", 1))
+        if processes >= 2:
+            # DESIGN 5.5.1 step 0: per-worker records, persisted with the plan before launch.
+            new_plan["processes"] = processes
+            new_plan["workers"] = split_selfplay_workers(new_plan["target_games"], processes, new_plan["chunk_id_start"],
+                                                         new_plan["seed"])
+        plan = self._begin("selfplay", new_plan)
         if "v_resign" not in plan:
             # Plan written by a version without resign selection (resignation was always
             # off): keep the threshold that phase was started with and persist it.
@@ -278,27 +432,10 @@ class Pipeline:
         self.state["v_resign"] = plan["v_resign"]
         for tmp in self.run.glob("replay/*.tmp"):
             tmp.unlink()
-        existing = 0
-        max_id = plan["chunk_id_start"] - 1
-        for p in self._published_chunks(plan["chunk_prefix"]):
-            h = read_header(p)
-            existing += h.num_games
-            max_id = max(max_id, h.chunk_id)
-        remaining = plan["target_games"] - existing
-        if remaining > 0:
-            sgf_dir = self.run / "sgf" / f"{it:04d}"
-            args = [self.exe("mango_selfplay"), "--model", self.model_dir(plan["model_id"]), "--config",
-                    self.run / "config.json", "--games", remaining, "--out", self.run / "replay", "--chunk-prefix",
-                    plan["chunk_prefix"], "--chunk-id-start", max_id + 1, "--seed", plan["seed"], "--sgf-dir", sgf_dir,
-                    "--iteration", it, "--device", self.selfplay_device, "--resign-threshold", plan["v_resign"]]
-            t0 = time.time()
-            out = self._run_subprocess(args, "selfplay.log")
-            summary = json.loads(out.strip().splitlines()[-1])
-            summary["seconds"] = round(time.time() - t0, 1)
-            self.log(f"selfplay: {summary['games']} games, {summary['positions']} positions, "
-                     f"avg length {summary['avg_game_length']:.1f}, {summary['terminations']}, "
-                     f"resign {plan['v_resign']:g}, {summary['seconds']}s")
-            self.state.setdefault("selfplay_stats", {})[str(it)] = summary
+        if plan.get("workers"):
+            self._selfplay_workers(plan, it)
+        else:
+            self._selfplay_single(plan, it)
         self._update_manifest(plan["chunk_prefix"], it)
         if plan["v_resign"] is not None and plan["v_resign"] > -1.0:
             # Diagnostic: how often this iteration's eventual winners dipped below v_resign.
@@ -312,9 +449,85 @@ class Pipeline:
                      f"{fpr['samples']} no-resign games of this iteration; counterfactual label errors "
                      f"{cf['mislabelled'] if cf else 0}/{cf['triggered'] if cf else 0} of the games it would have ended "
                      f"({cf_rate if cf_rate is None else f'{cf_rate:.3f}'})")
-        ids = [c["chunk_id"] for c in self.manifest()["chunks"]]
-        self.state["next_chunk_id"] = (max(ids) + 1) if ids else 1
+        if plan.get("workers"):
+            self.state["next_chunk_id"] = int(plan["workers"][-1]["chunk_id_end"])  # every block lies below it
+        else:
+            ids = [c["chunk_id"] for c in self.manifest()["chunks"]]
+            self.state["next_chunk_id"] = (max(ids) + 1) if ids else 1
         self._end("selfplay")
+
+    def _selfplay_command(self) -> list[Any]:
+        """The self-play executable (tests substitute a fake driver here)."""
+        return [self.exe("mango_selfplay")]
+
+    def _selfplay_args(self, plan: dict[str, Any], it: int, games: int, chunk_id_start: int, seed: int) -> list[Any]:
+        return self._selfplay_command() + [
+            "--model", self.model_dir(plan["model_id"]), "--config", self.run / "config.json", "--games", games, "--out",
+            self.run / "replay", "--chunk-prefix", plan["chunk_prefix"], "--chunk-id-start", chunk_id_start, "--seed", seed,
+            "--sgf-dir", self.run / "sgf" / f"{it:04d}", "--iteration", it, "--device", self.selfplay_device,
+            "--resign-threshold", plan["v_resign"]]
+
+    def _selfplay_single(self, plan: dict[str, Any], it: int) -> None:
+        """selfplay.processes = 1: one process for the games not yet published (M4 path)."""
+        existing = 0
+        max_id = plan["chunk_id_start"] - 1
+        for p in self._published_chunks(plan["chunk_prefix"]):
+            h = read_header(p)
+            existing += h.num_games
+            max_id = max(max_id, h.chunk_id)
+        remaining = plan["target_games"] - existing
+        if remaining <= 0:
+            return
+        args = self._selfplay_args(plan, it, remaining, max_id + 1, plan["seed"])
+        t0 = time.time()
+        out = self._run_subprocess(args, "selfplay.log")
+        summary = json.loads(out.strip().splitlines()[-1])
+        summary["seconds"] = round(time.time() - t0, 1)
+        self.log(f"selfplay: {summary['games']} games, {summary['positions']} positions, "
+                 f"avg length {summary['avg_game_length']:.1f}, {summary['terminations']}, "
+                 f"resign {plan['v_resign']:g}, {summary['seconds']}s")
+        self.state.setdefault("selfplay_stats", {})[str(it)] = summary
+
+    def _selfplay_workers(self, plan: dict[str, Any], it: int) -> None:
+        """selfplay.processes >= 2 (DESIGN 5.5.1 step 0): every worker of the plan plays its
+        own remaining quota — its `games` minus the games in the published chunks of its id
+        block — from max(published id in its block) + 1, with its own seed, concurrently."""
+        headers = [read_header(p) for p in self._published_chunks(plan["chunk_prefix"])]
+        launches: list[tuple[int, list[Any]]] = []
+        for w in plan["workers"]:
+            mine = [h for h in headers if w["chunk_id_start"] <= h.chunk_id < w["chunk_id_end"]]
+            remaining = int(w["games"]) - sum(h.num_games for h in mine)
+            if remaining <= 0:
+                continue
+            start = max((h.chunk_id for h in mine), default=w["chunk_id_start"] - 1) + 1
+            launches.append((int(w["k"]), self._selfplay_args(plan, it, remaining, start, int(w["seed"]))))
+        resumed = bool(headers)  # a restart: earlier launches of this phase published these
+        summary: dict[str, Any] = {"processes": len(plan["workers"])}
+        if launches:
+            t0 = time.time()
+            outputs = self._run_workers(launches, "selfplay")
+            summaries = {k: json.loads(out.strip().splitlines()[-1]) for k, out in outputs.items()}
+            summary = merge_selfplay_summaries(summaries, time.time() - t0, len(plan["workers"]))
+            per_worker = ", ".join(f"{w['k']}: {w['games']}g {w['positions_per_s']:.0f}pos/s" for w in summary["workers"]
+                                   if w["positions_per_s"] is not None)
+            self.log(f"selfplay: {summary['games']} games, {summary['positions']} positions, "
+                     f"avg length {summary['avg_game_length']:.1f}, {summary['terminations']}, "
+                     f"resign {plan['v_resign']:g}, {summary['seconds']}s over {len(launches)} of {len(plan['workers'])} "
+                     f"processes ({summary['positions_per_s']:.0f} positions/s; {per_worker})")
+        if resumed:
+            # The launch above (if any) played only what the interrupted launches had not
+            # published: the iteration's counts come from every published chunk, the
+            # launch's own counts and timing are kept aside, and the fields that only the
+            # interrupted launches could have supplied are flagged.
+            launch = {k: summary[k] for k in ("games", "positions") + LAUNCH_ONLY_FIELDS if k in summary}
+            summary.update(selfplay_counts_from_chunks(self._published_chunks(plan["chunk_prefix"])))
+            summary["resumed"] = True
+            summary["launch"] = launch
+            summary["incomplete"] = [k for k in LAUNCH_ONLY_FIELDS if k in summary]
+            self.log(f"selfplay: resumed phase — iteration totals {summary['games']} games, {summary['positions']} "
+                     f"positions from the published chunks; this launch {launch.get('games', 0)} games; timing and "
+                     f"evaluator fields cover this launch only")
+        self.state.setdefault("selfplay_stats", {})[str(it)] = summary
 
     def _latest_ckpt(self, max_step: int | None = None) -> tuple[Path, int]:
         best: tuple[Path, int] | None = None
