@@ -12,6 +12,7 @@ cap. The report has the same shape as `mango_match`'s JSON.
 from __future__ import annotations
 
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Sequence
 
@@ -84,11 +85,11 @@ class GtpClient:
             self.proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             self.proc.kill()
-
             self.proc.wait()
         for pipe in (self.proc.stdin, self.proc.stdout):
             if pipe is not None:
                 pipe.close()
+
     def __enter__(self) -> "GtpClient":
         return self
 
@@ -189,21 +190,47 @@ def bootstrap_mean_interval(values: Sequence[float], resamples: int = 10000, see
     return (float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5)))
 
 
-def play_gtp_match(cmd_a: Sequence[str], cmd_b: Sequence[str], referee_cmd: Sequence[str], n: int, komi: float,
-                   openings: Sequence[Sequence[int]], move_cap: int, name_a: str, name_b: str, seed: int = 1) -> dict:
-    """Every opening twice with colours swapped; A's pair scores and a bootstrap interval,
-    in the shape of `mango_match`'s report (fields used by strength.py)."""
+def _play_openings(cmd_a, cmd_b, referee_cmd, n, komi, openings, move_cap, name_a, name_b, first_pair):
+    """One worker: its own three engine processes, the given openings in order."""
     games: list[GtpGame] = []
     with GtpClient(cmd_a, name_a) as ea, GtpClient(cmd_b, name_b) as eb, GtpClient(referee_cmd, "referee") as ref:
-        for i, op in enumerate(openings):
+        for k, op in enumerate(openings):
+            i = first_pair + k
             games.append(play_gtp_game(ea, eb, ref, n, komi, op, move_cap, i, True))
             games.append(play_gtp_game(eb, ea, ref, n, komi, op, move_cap, i, False))
+    return games
+
+
+def play_gtp_match(cmd_a: Sequence[str], cmd_b: Sequence[str], referee_cmd: Sequence[str], n: int, komi: float,
+                   openings: Sequence[Sequence[int]], move_cap: int, name_a: str, name_b: str, seed: int = 1,
+                   workers: int = 1) -> dict:
+    """Every opening twice with colours swapped; A's pair scores and a bootstrap interval,
+    in the shape of `mango_match`'s report (fields used by strength.py). With `workers` > 1
+    the openings are split into contiguous blocks, each played by its own trio of engine
+    processes in parallel; the report lists the games in opening order either way. Each
+    trio starts its engines fresh, so a block's games depend on the block boundaries: a
+    report is reproducible for the same `workers` (recorded as `gtp_workers`), not across
+    different worker counts."""
+    workers = max(1, min(int(workers), len(openings) or 1))
+    if workers == 1:
+        games = _play_openings(cmd_a, cmd_b, referee_cmd, n, komi, openings, move_cap, name_a, name_b, 0)
+    else:
+        blocks = []
+        per = -(-len(openings) // workers)
+        for w in range(workers):
+            block = openings[w * per:(w + 1) * per]
+            if block:
+                blocks.append((w * per, block))
+        with ThreadPoolExecutor(max_workers=len(blocks)) as pool:
+            futures = [pool.submit(_play_openings, cmd_a, cmd_b, referee_cmd, n, komi, block, move_cap, name_a, name_b,
+                                   first) for first, block in blocks]
+            games = [g for f in futures for g in f.result()]
     pair_scores = [(games[2 * i].score_for_a() + games[2 * i + 1].score_for_a()) / 2.0 for i in range(len(openings))]
     wins = sum(1 for g in games if g.score_for_a() > 0.75)
     losses = sum(1 for g in games if g.score_for_a() < 0.25)
     ci = bootstrap_mean_interval(pair_scores, seed=seed)
     return {
-        "a": name_a, "b": name_b, "board_size": n, "komi": komi, "seed": seed, "driver": "gtp",
+        "a": name_a, "b": name_b, "board_size": n, "komi": komi, "seed": seed, "driver": "gtp", "gtp_workers": workers,
         "pairs": len(openings), "games": len(games), "wins_a": wins, "losses_a": losses,
         "draws_a": len(games) - wins - losses,
         "mean_pair_score": float(np.mean(pair_scores)) if pair_scores else 0.0, "ci95": [ci[0], ci[1]],

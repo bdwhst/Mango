@@ -396,7 +396,7 @@ class Ladder:
         cmd_a, cmd_b = (gtp["command"], mango_cmd) if x is gtp else (mango_cmd, gtp["command"])
         ops = load_openings(openings, int(self.cfg["eval"]["ladder_pairs"]))
         report = play_gtp_match(cmd_a, cmd_b, referee, self.n, self.komi, ops, effective_move_cap(self.cfg), x["name"],
-                                y["name"], seed=seed)
+                                y["name"], seed=seed, workers=int(self.cfg["eval"].get("gtp_workers", 1)))
         report["simulations"] = int(self.cfg["search"]["eval_simulations"])
         return report
 

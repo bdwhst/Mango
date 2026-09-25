@@ -80,3 +80,26 @@ def test_random_vs_random_match_over_gtp(gtp_exe):
     # Identical seeds on both sides make the second run identical.
     r2 = play_gtp_match(a, b, ref, n, 7.5, openings, move_cap=50, name_a="ra", name_b="rb", seed=5)
     assert [g["moves"] for g in r2["games_detail"]] == [g["moves"] for g in r["games_detail"]]
+    assert r["gtp_workers"] == 1
+
+
+def test_gtp_match_with_workers_keeps_opening_order_and_is_reproducible(gtp_exe):
+    n = 5
+    a = [gtp_exe, "--size", n, "--komi", 7.5, "--seed", 11]
+    b = [gtp_exe, "--size", n, "--komi", 7.5, "--seed", 12]
+    ref = [gtp_exe, "--size", n, "--komi", 7.5]
+    openings = [[0, 1], [12, 6], [24, 0], [4, 20], [2, 22]]
+    r = play_gtp_match(a, b, ref, n, 7.5, openings, move_cap=50, name_a="ra", name_b="rb", seed=5, workers=2)
+    assert r["gtp_workers"] == 2 and r["pairs"] == 5 and r["games"] == 10
+    for i, g in enumerate(r["games_detail"]):
+        assert g["pair"] == i // 2 and g["a_is_black"] == (i % 2 == 0) and g["moves"][:2] == openings[i // 2]
+    assert r["wins_a"] + r["losses_a"] + r["draws_a"] == 10
+    assert len(r["pair_scores"]) == 5 and abs(sum(r["pair_scores"]) / 5 - r["mean_pair_score"]) < 1e-9
+    # The first block (openings 0-2) is played by fresh engines exactly like a 3-opening sequential match.
+    r1 = play_gtp_match(a, b, ref, n, 7.5, openings[:3], move_cap=50, name_a="ra", name_b="rb", seed=5)
+    assert [g["moves"] for g in r["games_detail"][:6]] == [g["moves"] for g in r1["games_detail"]]
+    r2 = play_gtp_match(a, b, ref, n, 7.5, openings, move_cap=50, name_a="ra", name_b="rb", seed=5, workers=2)
+    assert [g["moves"] for g in r2["games_detail"]] == [g["moves"] for g in r["games_detail"]]
+    # More workers than openings: one trio per opening.
+    r3 = play_gtp_match(a, b, ref, n, 7.5, openings[:2], move_cap=50, name_a="ra", name_b="rb", seed=5, workers=8)
+    assert r3["gtp_workers"] == 2 and r3["games"] == 4
