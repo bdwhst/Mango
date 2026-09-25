@@ -22,10 +22,22 @@ struct Opening {
 // are returned if the board cannot provide that many distinct ones.
 std::vector<Opening> generateRandomOpenings(int n, float komi, int moveCap, int count, int k, uint64_t seed);
 
+// Opening set <-> JSON (an array of move arrays; pass is written as n*n, the same
+// encoding as the chunk format and the match report), the ladder's fixed opening
+// file (DESIGN 6.6). `openingsFromJson` validates legality by replay and throws
+// std::invalid_argument on a malformed or illegal opening.
+std::string openingsToJson(const std::vector<Opening>& openings, int n);
+std::vector<Opening> openingsFromJson(const std::string& text, int n, float komi, int moveCap);
+// Move list in the JSON encoding (pass = n*n).
+std::vector<int> movesToJson(const std::vector<Move>& moves, int n);
+
 struct MatchPlayer {
   NNEvaluator* ev = nullptr;
   SearchParams params;  // eval params: no noise, tau -> 0, fixed simulations
   std::string name;
+  // The ladder's random anchor (DESIGN 6.6): uniform over the legal board moves,
+  // pass only when no board move is legal. No evaluator, no tree.
+  bool random = false;
 };
 
 struct MatchGame {

@@ -8,7 +8,8 @@ import pytest
 
 from mango.chunk import (EXTRAS_FINAL_OWNERSHIP, EXTRAS_SEARCH_KIND, TERMINATION_RESIGN, TERMINATION_TWO_PASSES, Chunk,
                          ChunkHeader, GameRecord, pack_snapshot, write_chunk)
-from mango.data import ChunkDataset, Window, inverse_symmetry, symmetry_table, transform_map, transform_planes
+from mango.data import (ChunkDataset, Window, inverse_symmetry, symmetry_table, transform_map, transform_planes,
+                        write_holdout_games)
 
 
 def make_game(n: int, seed: int, T: int, result: int, extras: int = 0, termination: int = TERMINATION_TWO_PASSES,
@@ -131,3 +132,20 @@ def test_window_rejects_mixed_extras(tmp_path):
     with pytest.raises(ValueError):
         Window([a, b])
     assert inverse_symmetry(3) == 5
+
+
+def test_write_holdout_games_keeps_only_holdout_games(tmp_path):
+    n = 5
+    p1 = write_test_chunk(tmp_path / "a.mgo", n, [make_game(n, 20, 6, +1), make_game(n, 21, 5, -1)], chunk_id=1)
+    p2 = write_test_chunk(tmp_path / "b.mgo", n, [make_game(n, 40, 4, -1), make_game(n, 7, 4, +1)], chunk_id=2)
+    out = tmp_path / "fixed.mgo"
+    assert write_holdout_games([p1, p2], out) == 2
+    w = Window([out])
+    assert [g.record.game_seed for g in w.games] == [20, 40]
+    assert all(g.holdout for g in w.games)
+    ds = ChunkDataset(w, symmetry=False, holdout=True)
+    assert ds.train_positions == 6 + 4
+    # No holdout game: nothing is written.
+    p3 = write_test_chunk(tmp_path / "c.mgo", n, [make_game(n, 3, 4, +1)], chunk_id=3)
+    assert write_holdout_games([p3], tmp_path / "none.mgo") == 0
+    assert not (tmp_path / "none.mgo").exists()

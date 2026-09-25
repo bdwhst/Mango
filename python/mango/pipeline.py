@@ -1,13 +1,16 @@
-"""Sequential orchestration (docs/DESIGN.md section 6.5), M3a' version.
+"""Sequential orchestration (docs/DESIGN.md section 6.5).
 
 runs/<name>/
   config.json  state.json  models/<model_id>/  best.json  learner/ckpt_*.pt
   replay/manifest.json  replay/chunk_*.mgo  sgf/<iteration>/  matches/<iteration>.json
-  monitor/holdout.csv  logs/  check.json
+  strength/ (ladder, openings, ratings)  monitor/holdout.csv  logs/  check.json
 
+Phases per iteration: selfplay, train, monitor, export, gate, promote, strength.
 state.json is rewritten atomically before a phase starts (with the phase's plan) and
-when it ends; every phase reconciles its outputs against the plan on restart.
-Resignation stays disabled here (v_resign = -1; the automatic threshold is M4).
+when it ends; every phase reconciles its outputs against the plan on restart. With
+search.resign_auto the self-play plan carries the v_resign selected from the window's
+no-resign games (DESIGN 5.4.7); the strength phase adds every promoted model and every
+eval.ladder_every-th candidate to the frozen ladder (DESIGN 6.6).
 
     python -m mango.pipeline --run runs/smoke --config configs/5x5-smoke.json \
         --bin build/windows-cuda/Release --iterations 30 [--device cuda] [--check]
@@ -17,12 +20,9 @@ from __future__ import annotations
 
 import argparse
 import csv
-import glob
 import json
-import os
 import platform
 import re
-import shutil
 import subprocess
 import sys
 import time
@@ -33,13 +33,16 @@ import torch
 
 from .chunk import EXTRAS_SEARCH_KIND, read_chunk, read_header
 from .config import effective_move_cap, load_config, merge_config
+from .data import write_holdout_games
 from .export import export_model_version, load_eager_model, make_model_id
 from .known_outcome import known_positions, value_sign_accuracy
-from .state import read_json, write_json_atomic
+from .resign import measured_false_positive_rate, select_resign_threshold
+from .state import derive_seed, read_json, write_json_atomic
+from .strength import Ladder, format_ratings
 from .train import (build_model, build_optimizer, build_window_dataset, bounded_steps, evaluate_dataset,
                     load_checkpoint, make_scaler, save_checkpoint, train_until)
 
-PHASES = ["selfplay", "train", "monitor", "export", "gate", "promote"]
+PHASES = ["selfplay", "train", "monitor", "export", "gate", "promote", "strength"]
 
 
 def pick_device(name: str | None) -> torch.device:
@@ -50,15 +53,6 @@ def pick_device(name: str | None) -> torch.device:
     if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
-
-
-def derive_seed(a: int, b: int) -> int:
-    """Deterministic 63-bit seed for a phase (not required to match the C++ deriveSeed)."""
-    x = (a * 0x9E3779B97F4A7C15 + b * 0xC2B2AE3D27D4EB4F + 0x165667B19E3779F9) & 0xFFFFFFFFFFFFFFFF
-    x ^= x >> 31
-    x = (x * 0x7FB5D329728EA185) & 0xFFFFFFFFFFFFFFFF
-    x ^= x >> 27
-    return x & 0x7FFFFFFFFFFFFFFF
 
 
 class Pipeline:
@@ -170,9 +164,13 @@ class Pipeline:
         m["chunks"].sort(key=lambda c: c["chunk_id"])
         write_json_atomic(self.run / "replay" / "manifest.json", m)
 
+    def available_chunks(self) -> list[dict[str, Any]]:
+        """Manifest entries whose file still exists (evicted chunks stay listed)."""
+        return [c for c in self.manifest()["chunks"] if not c.get("evicted")]
+
     def window_chunks(self) -> list[Path]:
         """Most recent window_games games by manifest order (whole chunks, newest last)."""
-        m = self.manifest()["chunks"]
+        m = self.available_chunks()
         want = int(self.cfg["training"]["window_games"])
         chosen: list[str] = []
         games = 0
@@ -182,6 +180,51 @@ class Pipeline:
             chosen.append(c["path"])
             games += int(c["games"])
         return [self.run / "replay" / p for p in reversed(chosen)]
+
+    def _evict_old_chunks(self) -> int:
+        """Deletes chunk files that fell out of the window (DESIGN 6.3: between phases,
+        with no trainer alive); their manifest entries are kept and marked evicted."""
+        if not self.cfg["selfplay"].get("evict_old_chunks", True):
+            return 0
+        keep = {p.name for p in self.window_chunks()}
+        m = self.manifest()
+        evicted = 0
+        for c in m["chunks"]:
+            if c.get("evicted") or c["path"] in keep:
+                continue
+            p = self.run / "replay" / c["path"]
+            if p.exists():
+                p.unlink()
+            c["evicted"] = True
+            evicted += 1
+        if evicted:
+            write_json_atomic(self.run / "replay" / "manifest.json", m)
+            self.log(f"evicted {evicted} chunk(s) that fell out of the window")
+        return evicted
+
+    def _resign_selection_chunks(self) -> list[Path]:
+        """Chunks the resign selection reads: the window (DESIGN 5.4.7, the paper) or,
+        with search.resign_select_scope = "latest", only the previous iteration's."""
+        scope = self.cfg["search"].get("resign_select_scope", "window")
+        if scope == "window":
+            return self.window_chunks()
+        if scope == "latest":
+            it = int(self.state["iteration"])
+            return self._published_chunks(f"chunk_{it - 1:04d}_") if it > 1 else []
+        raise ValueError(f"unknown search.resign_select_scope {scope!r}")
+
+    def _select_resign(self) -> dict[str, Any]:
+        """v_resign for the next self-play phase (DESIGN 5.4.7): from the no-resign games
+        of the selection scope when search.resign_auto, else the configured constant."""
+        s = self.cfg["search"]
+        if not s.get("resign_auto", False):
+            return {"threshold": float(s["resign_threshold"]), "auto": False}
+        games = [g for p in self._resign_selection_chunks() for g in read_chunk(p).games]
+        sel = select_resign_threshold(games, max_fpr=float(s.get("resign_fpr_target", 0.05)))
+        sel["auto"] = True
+        sel["scope"] = s.get("resign_select_scope", "window")
+        sel["fpr_target"] = float(s.get("resign_fpr_target", 0.05))
+        return sel
 
     # --- phases ----------------------------------------------------------------------------
 
@@ -197,7 +240,7 @@ class Pipeline:
 
     def _end(self, phase: str) -> None:
         nxt = PHASES[(PHASES.index(phase) + 1) % len(PHASES)]
-        if phase == "promote":
+        if phase == PHASES[-1]:
             self.state["iteration"] += 1
             self.state["plan"] = {}
         self.state["phase"] = nxt
@@ -205,6 +248,16 @@ class Pipeline:
 
     def phase_selfplay(self) -> None:
         it = self.state["iteration"]
+        if not self.state["plan"].get("selfplay"):
+            self._evict_old_chunks()
+            resign = self._select_resign()
+            v_resign = resign["threshold"] if resign["threshold"] is not None else -1.0
+            if resign.get("auto"):
+                rate = resign["false_positive_rate"]
+                self.log(f"resign: v_resign {v_resign:g} from {resign['samples']} no-resign games "
+                         f"(false-positive rate {rate if rate is None else f'{rate:.3f}'}, {resign['no_resign_games']} tagged)")
+        else:
+            resign, v_resign = None, None
         plan = self._begin("selfplay", {
             "task_id": str(it),
             "model_id": self.state["best_model_id"],
@@ -212,7 +265,17 @@ class Pipeline:
             "chunk_prefix": f"chunk_{it:04d}_",
             "chunk_id_start": int(self.state["next_chunk_id"]),
             "seed": derive_seed(self.state["run_seed"], it),
+            "v_resign": v_resign,
+            "resign_selection": resign,
         })
+        if "v_resign" not in plan:
+            # Plan written by a version without resign selection (resignation was always
+            # off): keep the threshold that phase was started with and persist it.
+            plan["v_resign"] = float(self.state.get("v_resign", -1.0))
+            plan["resign_selection"] = None
+            self.save_state()
+            self.log(f"resuming an older self-play plan; resign threshold {plan['v_resign']:g}")
+        self.state["v_resign"] = plan["v_resign"]
         for tmp in self.run.glob("replay/*.tmp"):
             tmp.unlink()
         existing = 0
@@ -227,15 +290,28 @@ class Pipeline:
             args = [self.exe("mango_selfplay"), "--model", self.model_dir(plan["model_id"]), "--config",
                     self.run / "config.json", "--games", remaining, "--out", self.run / "replay", "--chunk-prefix",
                     plan["chunk_prefix"], "--chunk-id-start", max_id + 1, "--seed", plan["seed"], "--sgf-dir", sgf_dir,
-                    "--iteration", it, "--device", self.selfplay_device]
+                    "--iteration", it, "--device", self.selfplay_device, "--resign-threshold", plan["v_resign"]]
             t0 = time.time()
             out = self._run_subprocess(args, "selfplay.log")
             summary = json.loads(out.strip().splitlines()[-1])
             summary["seconds"] = round(time.time() - t0, 1)
             self.log(f"selfplay: {summary['games']} games, {summary['positions']} positions, "
-                     f"avg length {summary['avg_game_length']:.1f}, {summary['terminations']}, {summary['seconds']}s")
+                     f"avg length {summary['avg_game_length']:.1f}, {summary['terminations']}, "
+                     f"resign {plan['v_resign']:g}, {summary['seconds']}s")
             self.state.setdefault("selfplay_stats", {})[str(it)] = summary
         self._update_manifest(plan["chunk_prefix"], it)
+        if plan["v_resign"] is not None and plan["v_resign"] > -1.0:
+            # Diagnostic: how often this iteration's eventual winners dipped below v_resign.
+            games = [g for p in self._published_chunks(plan["chunk_prefix"]) for g in read_chunk(p).games]
+            fpr = measured_false_positive_rate(games, plan["v_resign"])
+            self.state.setdefault("selfplay_stats", {}).setdefault(str(it), {})["resign_false_positive"] = fpr
+            rate = fpr["false_positive_rate"]
+            cf = fpr["counterfactual"]
+            cf_rate = cf["rate_of_triggered"] if cf else None
+            self.log(f"resign: measured false-positive rate {rate if rate is None else f'{rate:.3f}'} on "
+                     f"{fpr['samples']} no-resign games of this iteration; counterfactual label errors "
+                     f"{cf['mislabelled'] if cf else 0}/{cf['triggered'] if cf else 0} of the games it would have ended "
+                     f"({cf_rate if cf_rate is None else f'{cf_rate:.3f}'})")
         ids = [c["chunk_id"] for c in self.manifest()["chunks"]]
         self.state["next_chunk_id"] = (max(ids) + 1) if ids else 1
         self._end("selfplay")
@@ -287,20 +363,47 @@ class Pipeline:
             stats = train_until(model, optimizer, scaler, ds, self.cfg, step, target, self.device,
                                 ckpt_path=self.run / "learner" / f"ckpt_{target}.pt", log=self.log)
             save_checkpoint(self.run / "learner" / f"ckpt_{target}.pt", model, optimizer, scaler, target, self.cfg)
+            stats["seconds"] = round(time.time() - t0, 1)
             self.log(f"train: done in {time.time() - t0:.1f}s, mean loss {stats.get('total', float('nan')):.4f} "
                      f"(v {stats.get('value', float('nan')):.4f} p {stats.get('policy', float('nan')):.4f})")
             self.state.setdefault("train_stats", {})[str(it)] = stats
         self.state["global_step"] = target
         self._end("train")
 
+    def _fixed_holdout(self) -> Path | None:
+        """The fixed validation set (DESIGN 6.6): the holdout games of iteration
+        training.fixed_holdout_iteration, frozen once into monitor/fixed_holdout.mgo. None
+        when disabled or not (yet) available."""
+        k = int(self.cfg["training"].get("fixed_holdout_iteration", 0))
+        if k <= 0:
+            return None
+        path = self.run / "monitor" / "fixed_holdout.mgo"
+        if path.exists():
+            return path
+        if int(self.state["iteration"]) < k:
+            return None
+        chunks = self._published_chunks(f"chunk_{k:04d}_")
+        if not chunks:
+            self.log(f"monitor: fixed holdout set from iteration {k} cannot be built (chunks gone)")
+            return None
+        n = write_holdout_games(chunks, path)
+        if n == 0:
+            self.log(f"monitor: iteration {k} has no holdout games; fixed validation set is empty")
+            return None
+        self.log(f"monitor: froze {n} holdout games of iteration {k} as the fixed validation set")
+        return path
+
     def phase_monitor(self) -> None:
         it = self.state["iteration"]
         plan = self._begin("monitor", {"step": self.state["global_step"], "window": self.state["plan"]["train"]["window"]})
         csv_path = self.run / "monitor" / "holdout.csv"
         done = False
+        fields_on_disk = None
         if csv_path.exists():
             with open(csv_path, newline="", encoding="utf-8") as f:
-                done = any(int(r["iteration"]) == it for r in csv.DictReader(f))
+                reader = csv.DictReader(f)
+                fields_on_disk = reader.fieldnames
+                done = any(int(r["iteration"]) == it for r in reader)
         if not done:
             paths = [self.run / "replay" / w for w in plan["window"]]
             model = build_model(self.cfg).to(self.device)
@@ -309,18 +412,27 @@ class Pipeline:
             hold = build_window_dataset(paths, self.cfg, seed=0, holdout=True, symmetry=False)
             train = build_window_dataset(paths, self.cfg, seed=0, holdout=False, symmetry=False)
             h = evaluate_dataset(model, hold, self.device)
-            tr = evaluate_dataset(model, train, self.device, max_positions=4096)
+            tr = evaluate_dataset(model, train, self.device, max_positions=4096, seed=derive_seed(it, 11))
+            fixed_path = self._fixed_holdout()
+            fx = {"positions": 0, "value_mse": float("nan"), "policy_ce": float("nan")}
+            if fixed_path is not None:
+                fixed = build_window_dataset([fixed_path], self.cfg, seed=0, holdout=True, symmetry=False)
+                fx = evaluate_dataset(model, fixed, self.device)
             row = {"iteration": it, "step": plan["step"], "holdout_positions": h["positions"],
                    "holdout_value_mse": h["value_mse"], "holdout_policy_ce": h["policy_ce"],
-                   "train_positions": tr["positions"], "train_value_mse": tr["value_mse"], "train_policy_ce": tr["policy_ce"]}
+                   "train_positions": tr["positions"], "train_value_mse": tr["value_mse"], "train_policy_ce": tr["policy_ce"],
+                   "fixed_positions": fx["positions"], "fixed_value_mse": fx["value_mse"], "fixed_policy_ce": fx["policy_ce"]}
             new = not csv_path.exists()
             with open(csv_path, "a", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=list(row.keys()))
+                # A CSV started by an older version keeps its columns (extra fields are dropped).
+                w = csv.DictWriter(f, fieldnames=list(fields_on_disk or row.keys()), extrasaction="ignore")
                 if new:
                     w.writeheader()
                 w.writerow(row)
             self.log(f"monitor: holdout v_mse {h['value_mse']:.4f} p_ce {h['policy_ce']:.4f} ({h['positions']} pos); "
-                     f"train v_mse {tr['value_mse']:.4f} p_ce {tr['policy_ce']:.4f}")
+                     f"train sample v_mse {tr['value_mse']:.4f} p_ce {tr['policy_ce']:.4f}"
+                     + (f"; fixed set v_mse {fx['value_mse']:.4f} p_ce {fx['policy_ce']:.4f} ({fx['positions']} pos)"
+                        if fixed_path is not None else ""))
         self._end("monitor")
 
     def phase_export(self) -> None:
@@ -356,7 +468,7 @@ class Pipeline:
                 args = [self.exe("mango_match"), "--a", self.model_dir(plan["candidate_model_id"]), "--b",
                         self.model_dir(plan["incumbent_model_id"]), "--config", self.run / "config.json", "--pairs",
                         int(self.cfg["eval"]["pairs"]), "--seed", plan["match_seed"], "--out", report_path, "--device",
-                        self.selfplay_device]
+                        self.selfplay_device, "--games-in-flight", int(self.cfg["selfplay"]["games_in_flight"])]
                 t0 = time.time()
                 self._run_subprocess(args, "match.log")
                 report = read_json(report_path)
@@ -384,13 +496,55 @@ class Pipeline:
         self.log(f"promote: {'promoted' if plan['decision'] else 'rejected'} {plan['candidate_model_id']}")
         self._end("promote")
 
+    def phase_strength(self) -> None:
+        """Frozen ladder (DESIGN 6.6): every promoted model and every ladder_every-th
+        candidate is added and plays the anchors and its nearest neighbours."""
+        it = self.state["iteration"]
+        promote = self.state["plan"]["promote"]
+        every = int(self.cfg["eval"]["ladder_every"])
+        add = bool(promote["decision"]) or (every > 0 and it % every == 0)
+        plan = self._begin("strength", {"add": add, "model_id": promote["candidate_model_id"],
+                                        "promoted": bool(promote["decision"])})
+        if plan["add"]:
+            ladder = Ladder(self.run, self.cfg, self.bin, self.state["run_seed"], self.selfplay_device,
+                            runner=self._run_subprocess, log=self.log)
+            t0 = time.time()
+            if not ladder.model_entries():
+                ladder.add_model(self.state["initial_model_id"], 0, False)
+            ladder.add_model(plan["model_id"], it, plan["promoted"])
+            fit = ladder.fit(fit_iteration=it)
+            r = fit["ratings"][plan["model_id"]]
+            self.state.setdefault("strength", {})[str(it)] = {
+                "model_id": plan["model_id"], "elo": r["elo"], "low": r["low"], "high": r["high"], "games": r["games"],
+                "separated": r["separated"], "entries": len(ladder.data["entries"]), "matches": len(ladder.data["matches"]),
+            }
+            self.log(f"strength: {plan['model_id']} rated {r['elo']:.0f} [{r['low']:.0f}, {r['high']:.0f}] Elo "
+                     f"({'separated, ' if r['separated'] else ''}{r['games']} games; ladder {len(ladder.data['entries'])} "
+                     f"entries, {len(ladder.data['matches'])} matches, {time.time() - t0:.0f}s)")
+            self.log("strength ladder:\n" + format_ratings(fit, ladder.data["entries"]))
+        self._end("strength")
+
     def run_phase(self) -> None:
         getattr(self, "phase_" + self.state["phase"])()
 
     def run_iterations(self, iterations: int) -> None:
-        """Runs until iteration `iterations` has completed its promote phase."""
+        """Runs until iteration `iterations` has completed all its phases."""
         while self.state["iteration"] <= iterations:
             self.run_phase()
+
+    def run_for_seconds(self, budget: float) -> int:
+        """Equal-wall-clock budgets (DESIGN 8.2): runs whole iterations until `budget`
+        seconds have elapsed in this call; the iteration in progress is always completed.
+        Returns the number of iterations completed."""
+        t0 = time.time()
+        done = 0
+        while True:
+            start = self.state["iteration"]
+            while self.state["iteration"] == start:
+                self.run_phase()
+            done += 1
+            if time.time() - t0 >= budget:
+                return done
 
     # --- M3a' learning check ---------------------------------------------------------------
 
@@ -401,7 +555,7 @@ class Pipeline:
         last two moves were passes, so the stones are final). On-distribution, never trained on."""
         from .chunk import TERMINATION_TWO_PASSES
 
-        chunks = [self.run / "replay" / c["path"] for c in self.manifest()["chunks"][-max_chunks:]]
+        chunks = [self.run / "replay" / c["path"] for c in self.available_chunks()[-max_chunks:]]
         if not chunks:
             return {"positions": 0, "accuracy": float("nan")}
         ds = build_window_dataset(chunks, self.cfg, seed=0, holdout=True, symmetry=False)
@@ -431,7 +585,8 @@ class Pipeline:
         report_path = self.run / "check_match.json"
         args = [self.exe("mango_match"), "--a", self.model_dir(best_id), "--b", self.model_dir(initial_id), "--config",
                 self.run / "config.json", "--pairs", pairs or int(self.cfg["eval"]["pairs"]), "--seed",
-                derive_seed(self.state["run_seed"], 999_999), "--out", report_path, "--device", self.selfplay_device]
+                derive_seed(self.state["run_seed"], 999_999), "--out", report_path, "--device", self.selfplay_device,
+                "--games-in-flight", int(self.cfg["selfplay"]["games_in_flight"])]
         self._run_subprocess(args, "check_match.log")
         match = read_json(report_path)
         result = {
@@ -455,11 +610,12 @@ class Pipeline:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Mango sequential pipeline (M3a')")
+    ap = argparse.ArgumentParser(description="Mango sequential pipeline (DESIGN 6.5)")
     ap.add_argument("--run", required=True)
     ap.add_argument("--config", help="config JSON (required to create a run)")
     ap.add_argument("--bin", required=True, help="directory with mango_selfplay / mango_match")
     ap.add_argument("--iterations", type=int, default=0, help="run until this iteration has completed")
+    ap.add_argument("--hours", type=float, default=0.0, help="run whole iterations until this wall-clock budget is used")
     ap.add_argument("--device", default="auto", help="training device: auto | cuda | mps | cpu")
     ap.add_argument("--selfplay-device", default=None, help="device for the C++ engines (default: same)")
     ap.add_argument("--seed", type=int, default=1, help="run seed (new runs only)")
@@ -470,6 +626,8 @@ def main(argv: list[str] | None = None) -> int:
     p = Pipeline(args.run, cfg, args.bin, args.device, args.selfplay_device, args.seed)
     if args.iterations > 0:
         p.run_iterations(args.iterations)
+    if args.hours > 0:
+        p.run_for_seconds(args.hours * 3600.0)
     if args.check:
         result = p.check(args.check_pairs)
         print(json.dumps(result, indent=2))

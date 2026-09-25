@@ -1,7 +1,9 @@
 // mango_selfplay: self-play with G games in flight, K = 1 (DESIGN 5.5).
 //   mango_selfplay --model DIR --config CFG --games N --out DIR [--chunk-prefix P]
 //                  [--chunk-id-start K] [--seed S] [--sgf-dir DIR] [--device D] [--fp32]
-//                  [--iteration I] [--games-in-flight G]
+//                  [--iteration I] [--games-in-flight G] [--resign-threshold T]
+// --resign-threshold overrides search.resign_threshold (the pipeline passes the value
+// selected per iteration, DESIGN 5.4.7; -1 disables resignation).
 // Publishes chunks of config selfplay.chunk_games games (atomic rename) and prints a
 // JSON summary line (games, positions, evaluations, timing) to stdout on completion.
 #include <cstdlib>
@@ -29,6 +31,8 @@ int main(int argc, char** argv) {
   int games = -1, iteration = 0, gamesInFlight = -1;
   uint64_t chunkIdStart = 0, seed = 1;
   bool fp32 = false;
+  bool haveResign = false;
+  float resignThreshold = -1.0f;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -49,6 +53,10 @@ int main(int argc, char** argv) {
     else if (a == "--device") device = next();
     else if (a == "--iteration") iteration = std::atoi(next().c_str());
     else if (a == "--games-in-flight") gamesInFlight = std::atoi(next().c_str());
+    else if (a == "--resign-threshold") {
+      resignThreshold = std::strtof(next().c_str(), nullptr);
+      haveResign = true;
+    }
     else if (a == "--fp32") fp32 = true;
     else {
       std::cerr << "unknown option " << a << "\n";
@@ -64,7 +72,8 @@ int main(int argc, char** argv) {
   return 1;
 #else
   try {
-    const mango::Config cfg = mango::Config::load(configPath);
+    mango::Config cfg = mango::Config::load(configPath);
+    if (haveResign) cfg.search.resignThreshold = resignThreshold;
     mango::TorchEvaluator::Options o;
     o.device = device;
     o.fp16 = !fp32;
@@ -92,7 +101,9 @@ int main(int argc, char** argv) {
     base.params = mango::SearchParams::fromConfig(cfg.search, cfg.board.size, /*selfplay=*/true);
 
     std::cerr << "mango_selfplay: model " << ev.modelId() << " on " << ev.deviceName() << (ev.isHalf() ? " (fp16)" : " (fp32)")
-              << ", " << base.params.simulations << " sims/move, " << games << " games, " << G << " in flight\n";
+              << ", " << base.params.simulations << " sims/move, " << games << " games, " << G << " in flight, resign "
+              << (base.params.resignThreshold <= -1.0f ? std::string("off") : std::to_string(base.params.resignThreshold))
+              << "\n";
 
     const int perChunk = std::max(1, cfg.selfplay.chunkGames);
     std::map<int, int> terminations;
@@ -159,6 +170,7 @@ int main(int argc, char** argv) {
     summary["avg_game_length"] = st.games ? static_cast<double>(st.positions) / st.games : 0.0;
     summary["black_wins"] = blackWins;
     summary["terminations"] = {{"two_passes", terminations[0]}, {"resign", terminations[1]}, {"move_cap", terminations[2]}};
+    summary["resign_threshold"] = base.params.resignThreshold;
     summary["chunks"] = published;
     summary["next_chunk_id"] = chunkId;
     summary["model_id"] = ev.modelId();

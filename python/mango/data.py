@@ -22,12 +22,32 @@ from typing import Iterator
 
 import numpy as np
 
-from .chunk import EXTRAS_SEARCH_KIND, TERMINATION_RESIGN, Chunk, GameRecord, read_chunk, unpack_snapshots
+from .chunk import EXTRAS_SEARCH_KIND, TERMINATION_RESIGN, Chunk, GameRecord, read_chunk, unpack_snapshots, write_chunk
 
 NUM_PLANES = 17
 HISTORY = 8
 NUM_SYMMETRIES = 8
 HOLDOUT_MODULUS = 20
+
+
+def write_holdout_games(chunk_paths: list[str | Path], out_path: str | Path) -> int:
+    """Copies the holdout games (game_seed % 20 == 0, never trained on) of the given
+    chunks into one chunk at `out_path`: a fixed validation set that stays the same
+    while the window moves (DESIGN 6.6). Returns the number of games written; nothing is
+    written when there is none."""
+    games: list[GameRecord] = []
+    header = None
+    for p in chunk_paths:
+        c = read_chunk(p)
+        if header is None:
+            header = c.header
+        elif (c.header.board_size, c.header.record_extras) != (header.board_size, header.record_extras):
+            raise ValueError("fixed holdout set: chunks differ in board size or record_extras")
+        games.extend(g for g in c.games if g.is_holdout)
+    if not games or header is None:
+        return 0
+    write_chunk(out_path, Chunk(header, games))
+    return len(games)
 
 
 # --- symmetries ---------------------------------------------------------------------------
@@ -216,11 +236,22 @@ class ChunkDataset:
         syms = self.rng.integers(0, NUM_SYMMETRIES, size=batch_size) if self.symmetry else np.zeros(batch_size, np.int64)
         return self._collate([(int(self.index.entries[i, 0]), int(self.index.entries[i, 1]), int(s)) for i, s in zip(picks, syms)])
 
-    def iterate_all(self, batch_size: int) -> Iterator[dict[str, np.ndarray]]:
-        """Every indexed position once, no symmetry (holdout monitor)."""
-        for start in range(0, len(self.index), batch_size):
-            rows = self.index.entries[start : start + batch_size]
+    def iterate_all(self, batch_size: int, max_positions: int | None = None, seed: int = 0) -> Iterator[dict[str, np.ndarray]]:
+        """Every indexed position once, no symmetry (holdout monitor). With `max_positions`
+        smaller than the index, a seeded uniform random subset of that size (the training
+        sample of the monitor must not be the oldest chunk's positions)."""
+        entries = self.subset_entries(max_positions, seed)
+        for start in range(0, len(entries), batch_size):
+            rows = entries[start : start + batch_size]
             yield self._collate([(int(gi), int(t), 0) for gi, t in rows])
+
+    def subset_entries(self, max_positions: int | None, seed: int) -> np.ndarray:
+        """The (game, t) rows iterate_all visits: all of them, or a seeded uniform random
+        subset of `max_positions` rows (in index order) when the index is larger."""
+        if max_positions is None or max_positions >= len(self.index):
+            return self.index.entries
+        pick = np.sort(np.random.default_rng(seed).choice(len(self.index), size=max_positions, replace=False))
+        return self.index.entries[pick]
 
     def _collate(self, items: list[tuple[int, int, int]]) -> dict[str, np.ndarray]:
         n = self.n

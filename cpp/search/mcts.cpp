@@ -60,14 +60,16 @@ int SearchTree::selectEdge(const Node& node) const {
   double sumN = 0.0;
   for (const Edge& e : node.edges) sumN += e.N + e.virtualLoss;
   const double sqrtSum = std::sqrt(sumN);
-  const float fpu = params_.fpu == SearchParams::Fpu::Parent ? node.nnValue : 0.0f;
+  const float fpu = params_.fpu == SearchParams::Fpu::Parent ? node.value() : 0.0f;
   int best = -1;
   double bestScore = 0.0;
   float bestP = 0.0f;
   for (int i = 0; i < static_cast<int>(node.edges.size()); ++i) {
     const Edge& e = node.edges[i];
     const uint32_t nEff = e.N + e.virtualLoss;
-    const double q = nEff > 0 ? (static_cast<double>(e.W) - e.virtualLoss) / nEff : fpu;
+    // An unvisited move that ends the game has an exact value: use it instead of the
+    // FPU value (DESIGN 5.4.10), so a winning pass is found and a losing one avoided.
+    const double q = nEff > 0 ? (static_cast<double>(e.W) - e.virtualLoss) / nEff : (e.endsGame() ? e.terminalValue : fpu);
     const double u = params_.cPuct * e.P * sqrtSum / (1.0 + nEff);
     const double s = q + u;
     // Tie-break: higher prior first, then lower index (strict comparisons keep the first).
@@ -83,13 +85,35 @@ int SearchTree::selectEdge(const Node& node) const {
 // ---------------------------------------------------------------------------
 // Expansion and backup
 
-void SearchTree::makeTerminal(Node& node, const Board& board) {
-  node.state = NodeState::Terminal;
-  node.toMove = board.toMove();
+// Exact value of a finished game for the player to move at that position (5.4.1 rule 4).
+static float terminalValueOf(const Board& board) {
   const float score = board.score();  // black - white - komi
   float v = score > 0 ? 1.0f : (score < 0 ? -1.0f : 0.0f);
   if (board.toMove() == Color::White) v = -v;
-  node.terminalValue = v;
+  return v;
+}
+
+void SearchTree::makeTerminal(Node& node, const Board& board) {
+  node.state = NodeState::Terminal;
+  node.toMove = board.toMove();
+  node.terminalValue = terminalValueOf(board);
+}
+
+void SearchTree::resolveTerminalMoves(Node& node, const Board& board) {
+  // Moves that end the game: a second consecutive pass, or any move at the cap. Their
+  // outcome is exact and costs no evaluation; the chooser can guarantee the best of them.
+  node.terminalMoveValue = Edge::kNoTerminal;
+  const bool passEnds = board.consecutivePasses() == 1;
+  const bool capEnds = board.moveCount() + 1 >= board.moveCap();
+  if (!passEnds && !capEnds) return;
+  for (Edge& e : node.edges) {
+    if (!capEnds && e.move != kPass) continue;
+    Board after = board;
+    after.play(e.move);
+    if (!after.gameOver()) continue;  // cannot happen; kept as a guard
+    e.terminalValue = -terminalValueOf(after);  // rule 3: the chooser's perspective
+    if (e.terminalValue > node.terminalMoveValue) node.terminalMoveValue = e.terminalValue;
+  }
 }
 
 void SearchTree::expandInto(Node& node, const Board& board, const HashHistory& hist, const NNOutput& out, int symmetry) {
@@ -119,6 +143,7 @@ void SearchTree::expandInto(Node& node, const Board& board, const HashHistory& h
   }
   node.toMove = board.toMove();
   node.nnValue = out.value;
+  if (params_.resolveTerminalMoves) resolveTerminalMoves(node, board);
   node.visitCount = 1;
   node.state = NodeState::Expanded;
 }
@@ -224,7 +249,7 @@ void SearchTree::commit(PendingLeaf& leaf, const NNOutput& out) {
     addRootNoise();  // root expansion: not a simulation
     return;
   }
-  backup(leaf.path, leaf.nodes, node, node.nnValue);
+  backup(leaf.path, leaf.nodes, node, node.value());
 }
 
 void SearchTree::abort(PendingLeaf& leaf) {

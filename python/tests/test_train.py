@@ -97,4 +97,15 @@ def test_holdout_monitor_uses_only_holdout_games(tmp_path):
     assert hold.train_positions == 12 and train.train_positions == 6
     model = build_model(CFG)
     r = evaluate_dataset(model, hold, torch.device("cpu"))
+    # A bounded evaluation uses a seeded random subset of the index, never its head.
+    tr = ChunkDataset(Window([p]), symmetry=False, holdout=False)
+    assert evaluate_dataset(model, tr, torch.device("cpu"))["positions"] == 6
+    assert evaluate_dataset(model, tr, torch.device("cpu"), max_positions=6)["positions"] == 6
+    assert evaluate_dataset(model, tr, torch.device("cpu"), max_positions=3, seed=1)["positions"] == 3
+    rows = {seed: [tuple(r) for r in tr.subset_entries(3, seed)] for seed in range(6)}
+    assert all(len(v) == 3 and v == sorted(v) for v in rows.values())
+    assert len({tuple(v) for v in rows.values()}) > 1  # seed-dependent
+    head = [tuple(r) for r in tr.index.entries[:3]]
+    assert any(v != head for v in rows.values())  # not simply the oldest positions
+    assert rows[1] == [tuple(r) for r in tr.subset_entries(3, 1)]  # reproducible
     assert r["positions"] == 12 and np.isfinite(r["value_mse"]) and np.isfinite(r["policy_ce"])

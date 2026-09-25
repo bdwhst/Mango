@@ -1,4 +1,9 @@
-"""Run configuration: JSON with defaults identical to cpp/core/config.h."""
+"""Run configuration: JSON with defaults identical to cpp/core/config.h.
+
+Keys the C++ side does not read (it ignores unknown keys): search.resign_auto,
+search.resign_select_scope, search.resign_fpr_target, selfplay.evict_old_chunks,
+training.fixed_holdout_iteration, eval.ladder_pairs, eval.ladder_neighbours, eval.gtp_anchor.
+"""
 
 from __future__ import annotations
 
@@ -21,8 +26,12 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "tree_reuse": True,
         "budget_includes_inherited": False,
         "resign_threshold": -1.0,
+        "resign_auto": False,  # True: the pipeline selects v_resign per iteration (DESIGN 5.4.7)
+        "resign_select_scope": "window",  # games the selection uses: "window" (paper) | "latest" (previous iteration only)
+        "resign_fpr_target": 0.05,  # the selection keeps the false-positive rate below this on those games
         "no_resign_fraction": 0.10,
         "nn_cache_size": 0,
+        "resolve_terminal_moves": True,  # exact values of game-ending moves in the search (DESIGN 5.4.10, D18)
     },
     "selfplay": {
         "games_per_iteration": 2000,
@@ -30,6 +39,7 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "leaves_per_game": 1,
         "chunk_games": 256,
         "save_sgf": True,
+        "evict_old_chunks": True,  # delete chunks that fell out of the window (DESIGN 6.3)
     },
     "training": {
         "res_blocks": 6,
@@ -45,8 +55,18 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "lr0": 0.01,
         "lr_step1": 30000,
         "lr_step2": 60000,
+        "fixed_holdout_iteration": 0,  # >0: freeze that iteration's holdout games as a fixed validation set (DESIGN 6.6)
     },
-    "eval": {"pairs": 200, "gate_threshold": 0.55, "opening_moves": 3, "ladder_every": 5, "gating": True},
+    "eval": {
+        "pairs": 200,
+        "gate_threshold": 0.55,
+        "opening_moves": 3,
+        "ladder_every": 5,
+        "gating": True,
+        "ladder_pairs": 50,       # pairs per ladder match (DESIGN 6.6)
+        "ladder_neighbours": 3,   # nearest ladder entries a new entry plays
+        "gtp_anchor": None,       # {"name": "gnugo", "command": ["gnugo", "--mode", "gtp", "--chinese-rules"]}
+    },
 }
 
 

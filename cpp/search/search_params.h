@@ -19,6 +19,7 @@ struct SearchParams {
   bool treeReuse = true;
   bool budgetIncludesInherited = false;
   float resignThreshold = -1.0f;    // r < threshold resigns; -1 disables (r >= -1 always)
+  bool resolveTerminalMoves = true; // exact values of game-ending moves at expansion/selection (DESIGN 5.4.10)
 
   static SearchParams fromConfig(const SearchConfig& c, int boardSize, bool selfplay) {
     SearchParams p;
@@ -33,6 +34,7 @@ struct SearchParams {
     p.treeReuse = c.treeReuse;
     p.budgetIncludesInherited = c.budgetIncludesInherited;
     p.resignThreshold = selfplay ? c.resignThreshold : -1.0f;
+    p.resolveTerminalMoves = c.resolveTerminalMoves;
     return p;
   }
 };

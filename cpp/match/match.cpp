@@ -46,21 +46,69 @@ std::vector<Opening> generateRandomOpenings(int n, float komi, int moveCap, int 
   return out;
 }
 
+std::vector<int> movesToJson(const std::vector<Move>& moves, int n) {
+  std::vector<int> out;
+  out.reserve(moves.size());
+  for (Move m : moves) out.push_back(m == kPass ? n * n : static_cast<int>(m));
+  return out;
+}
+
+std::string openingsToJson(const std::vector<Opening>& openings, int n) {
+  nlohmann::json ops = nlohmann::json::array();
+  for (const Opening& o : openings) ops.push_back(movesToJson(o.moves, n));
+  return ops.dump();
+}
+
+std::vector<Opening> openingsFromJson(const std::string& text, int n, float komi, int moveCap) {
+  nlohmann::json j;
+  try {
+    j = nlohmann::json::parse(text);
+  } catch (const std::exception& e) {
+    throw std::invalid_argument(std::string("openings: not JSON: ") + e.what());
+  }
+  if (!j.is_array()) throw std::invalid_argument("openings: expected an array of move arrays");
+  std::vector<Opening> out;
+  std::vector<Move> legal;
+  for (size_t i = 0; i < j.size(); ++i) {
+    if (!j[i].is_array()) throw std::invalid_argument("openings: entry " + std::to_string(i) + " is not an array");
+    Opening o;
+    Board b(n, komi, moveCap);
+    GameHistory h;
+    h.reset(b.hash());
+    for (const auto& v : j[i]) {
+      if (!v.is_number_integer()) throw std::invalid_argument("openings: entry " + std::to_string(i) + " has a non-integer move");
+      const long long m = v.get<long long>();
+      if (m < 0 || m > n * n) throw std::invalid_argument("openings: entry " + std::to_string(i) + " has a move out of range");
+      const Move mv = m == n * n ? kPass : static_cast<Move>(m);
+      if (!b.isLegal(mv, HashHistory(h))) throw std::invalid_argument("openings: entry " + std::to_string(i) + " is illegal");
+      b.play(mv);
+      h.push(mv, b.hash());
+      o.moves.push_back(mv);
+    }
+    out.push_back(std::move(o));
+  }
+  return out;
+}
+
 namespace {
 
-// One game in flight: both sides' trees follow the same board.
+// One game in flight: both sides' trees follow the same board. A random side (the
+// ladder anchor) has no tree; its moves come from its own seeded generator.
 struct MatchSlot {
   int pair = 0;
   bool aIsBlack = true;
   Board board;
   GameHistory hist;
   std::unique_ptr<SearchTree> tb, tw;
+  Rng rngB, rngW;
   MatchGame game;
   PendingLeaf leaf;
   bool active = false;
-  MatchSlot() : board(2, 0.0f) {}
+  std::vector<Move> legal;
+  MatchSlot() : board(2, 0.0f), rngB(0), rngW(0) {}
 
-  SearchTree& treeToMove() { return board.toMove() == Color::Black ? *tb : *tw; }
+  SearchTree* treePtrToMove() { return board.toMove() == Color::Black ? tb.get() : tw.get(); }
+  SearchTree& treeToMove() { return *treePtrToMove(); }
   bool moverIsA() const { return (board.toMove() == Color::Black) == aIsBlack; }
 
   void start(int pairIdx, bool aBlack, MatchPlayer& black, MatchPlayer& white, int n, float komi, int moveCap,
@@ -69,23 +117,45 @@ struct MatchSlot {
     aIsBlack = aBlack;
     board = Board(n, komi, moveCap);
     hist.reset(board.hash());
-    tb = std::make_unique<SearchTree>(black.params, n, seedBlack);
-    tw = std::make_unique<SearchTree>(white.params, n, seedWhite);
-    tb->newGame(board, hist);
-    tw->newGame(board, hist);
+    tb.reset();
+    tw.reset();
+    if (black.random) {
+      rngB.reseed(seedBlack);
+    } else {
+      tb = std::make_unique<SearchTree>(black.params, n, seedBlack);
+      tb->newGame(board, hist);
+    }
+    if (white.random) {
+      rngW.reseed(seedWhite);
+    } else {
+      tw = std::make_unique<SearchTree>(white.params, n, seedWhite);
+      tw->newGame(board, hist);
+    }
     game = MatchGame();
     game.pair = pairIdx;
     game.aIsBlack = aBlack;
     for (Move m : opening.moves) apply(m);
     active = true;
-    if (!board.gameOver()) treeToMove().prepareRoot();
+    afterMove();
   }
   void apply(Move m) {
     board.play(m);
     hist.push(m, board.hash());
-    tb->advance(m, board, hist);
-    tw->advance(m, board, hist);
+    if (tb) tb->advance(m, board, hist);
+    if (tw) tw->advance(m, board, hist);
     game.moves.push_back(m);
+  }
+  // The new side to move starts its search (root noise is off in matches, so this only
+  // matters for a reused root), exactly as runSequential would.
+  void afterMove() {
+    if (board.gameOver()) return;
+    if (SearchTree* t = treePtrToMove()) t->prepareRoot();
+  }
+  Move randomMove() {
+    Rng& rng = board.toMove() == Color::Black ? rngB : rngW;
+    board.legalMoves(HashHistory(hist), legal);  // pass is last
+    if (legal.size() == 1) return kPass;
+    return legal[rng.uniformInt(static_cast<uint32_t>(legal.size() - 1))];
   }
   void finishGame() {
     game.score = board.score();
@@ -101,18 +171,20 @@ struct MatchSlot {
         finishGame();
         return false;
       }
-      SearchTree& tree = treeToMove();
+      SearchTree* treePtr = treePtrToMove();
+      if (treePtr == nullptr) {  // random side: no search
+        apply(randomMove());
+        afterMove();
+        continue;
+      }
+      SearchTree& tree = *treePtr;
       if (!tree.rootExpanded()) {
         if (tree.collectLeaf(leaf) != CollectResult::Pending) throw std::logic_error("unexpected collect result at the root");
         return true;
       }
       if (tree.budgetExhausted()) {
         apply(tree.selectMove(board.moveCount()));
-        if (board.gameOver()) {
-          finishGame();
-          return false;
-        }
-        treeToMove().prepareRoot();
+        afterMove();
         continue;
       }
       const CollectResult r = tree.collectLeaf(leaf);
@@ -159,7 +231,8 @@ MatchReport playMatch(MatchPlayer a, MatchPlayer b, int n, float komi, int moveC
   r.nameB = b.name;
   r.boardSize = n;
   r.komi = komi;
-  r.simulations = a.params.simulations;
+  r.simulations = a.random ? b.params.simulations : a.params.simulations;
+  if (a.random && b.random && !openings.empty()) r.simulations = 0;
   r.seed = seed;
   r.openings = openings;
   const int totalGames = static_cast<int>(openings.size()) * 2;
@@ -185,11 +258,12 @@ MatchReport playMatch(MatchPlayer a, MatchPlayer b, int n, float komi, int moveC
   std::vector<MatchSlot*> batchA, batchB;
   std::vector<NNInput> in;
   std::vector<NNOutput> out;
-  auto flush = [&](std::vector<MatchSlot*>& batch, NNEvaluator& ev) {
+  auto flush = [&](std::vector<MatchSlot*>& batch, NNEvaluator* ev) {
     if (batch.empty()) return;
+    if (ev == nullptr) throw std::logic_error("a random player has no pending leaves");
     in.clear();
     for (MatchSlot* s : batch) in.push_back(s->leaf.input());
-    ev.evaluate(in, out);
+    ev->evaluate(in, out);
     for (size_t k = 0; k < batch.size(); ++k) batch[k]->treeToMove().commit(batch[k]->leaf, out[k]);
     batch.clear();
   };
@@ -206,8 +280,8 @@ MatchReport playMatch(MatchPlayer a, MatchPlayer b, int n, float komi, int moveC
         if (startNext(s)) ++active;
       }
     }
-    flush(batchA, *a.ev);
-    flush(batchB, *b.ev);
+    flush(batchA, a.ev);
+    flush(batchB, b.ev);
   }
   std::set<uint64_t> trajectories;
   for (size_t i = 0; i < openings.size(); ++i) {
@@ -251,7 +325,7 @@ std::string matchReportToJson(const MatchReport& r) {
   j["unique_trajectories"] = r.uniqueTrajectories;
   j["pair_scores"] = r.pairScores;
   nlohmann::json ops = nlohmann::json::array();
-  for (const Opening& o : r.openings) ops.push_back(o.moves);
+  for (const Opening& o : r.openings) ops.push_back(movesToJson(o.moves, r.boardSize));
   j["openings"] = ops;
   nlohmann::json games = nlohmann::json::array();
   for (const MatchGame& g : r.games) {
@@ -260,7 +334,7 @@ std::string matchReportToJson(const MatchReport& r) {
                      {"result", g.result},
                      {"score", g.score},
                      {"termination", static_cast<int>(g.termination)},
-                     {"moves", g.moves}});
+                     {"moves", movesToJson(g.moves, r.boardSize)}});
   }
   j["games_detail"] = games;
   return j.dump(2);

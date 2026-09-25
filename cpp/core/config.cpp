@@ -44,6 +44,7 @@ Config Config::fromJsonText(const std::string& text) {
     get(s, "resign_threshold", c.search.resignThreshold);
     get(s, "no_resign_fraction", c.search.noResignFraction);
     get(s, "nn_cache_size", c.search.nnCacheSize);
+    get(s, "resolve_terminal_moves", c.search.resolveTerminalMoves);
   }
   if (j.contains("selfplay")) {
     const json& s = j["selfplay"];
@@ -104,7 +105,8 @@ std::string Config::toJsonText() const {
                  {"budget_includes_inherited", search.budgetIncludesInherited},
                  {"resign_threshold", search.resignThreshold},
                  {"no_resign_fraction", search.noResignFraction},
-                 {"nn_cache_size", search.nnCacheSize}};
+                 {"nn_cache_size", search.nnCacheSize},
+                 {"resolve_terminal_moves", search.resolveTerminalMoves}};
   j["selfplay"] = {{"games_per_iteration", selfplay.gamesPerIteration},
                    {"games_in_flight", selfplay.gamesInFlight},
                    {"leaves_per_game", selfplay.leavesPerGame},
@@ -144,7 +146,8 @@ std::string Config::fingerprint() const {
                  {"temperature_moves", search.temperatureMoves},
                  {"search_symmetry", search.searchSymmetry},
                  {"tree_reuse", search.treeReuse},
-                 {"budget_includes_inherited", search.budgetIncludesInherited}};
+                 {"budget_includes_inherited", search.budgetIncludesInherited},
+                 {"resolve_terminal_moves", search.resolveTerminalMoves}};
   j["rules_id"] = 1;
   j["feature_schema"] = 1;
   const std::string canon = j.dump();

@@ -11,6 +11,9 @@
     "search_symmetry": true,
     "tree_reuse": true,
     "resign_threshold": -1.0,
+    "resign_auto": true,
+    "resign_select_scope": "window",
+    "resign_fpr_target": 0.05,
     "no_resign_fraction": 0.10
   },
   "selfplay": {"games_per_iteration": 2000, "games_in_flight": 128, "leaves_per_game": 1, "chunk_games": 256, "save_sgf": true},
@@ -26,7 +29,9 @@
     "store_pi": "visits",
     "lr0": 0.01,
     "lr_step1": 30000,
-    "lr_step2": 60000
+    "lr_step2": 60000,
+    "fixed_holdout_iteration": 5
   },
-  "eval": {"pairs": 200, "gate_threshold": 0.55, "opening_moves": 3, "ladder_every": 5, "gating": true}
+  "eval": {"pairs": 200, "gate_threshold": 0.55, "opening_moves": 3, "ladder_every": 5, "gating": true,
+           "ladder_pairs": 50, "ladder_neighbours": 3}
 }

@@ -28,6 +28,7 @@ struct SearchConfig {
   float resignThreshold = -1.0f;   // -1 -> disabled (r < -1 never)
   float noResignFraction = 0.10f;
   int nnCacheSize = 0;
+  bool resolveTerminalMoves = true;  // DESIGN 5.4.10 (D18); false = the paper's plain search
   float effectiveDirichletAlpha(int n) const {
     return dirichletAlpha >= 0 ? dirichletAlpha : 0.03f * 361.0f / static_cast<float>(n * n);
   }

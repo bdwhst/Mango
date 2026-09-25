@@ -124,7 +124,11 @@ TEST_CASE("backup signs: Q is from the perspective of the player choosing the ed
   Board b(n, 7.5f);
   GameHistory h;
   h.reset(b.hash());
-  SearchTree tree(testParams(60), n, 3);
+  // Plain search (5.4.4): with game-ending moves resolved (5.4.10) a pass answered by a
+  // pass carries an exact value that would mix into these constant-value averages.
+  SearchParams p = testParams(60);
+  p.resolveTerminalMoves = false;
+  SearchTree tree(p, n, 3);
   tree.newGame(b, h);
   tree.runSequential(ev);
   REQUIRE(tree.checkInvariants() == "");
@@ -244,7 +248,26 @@ TEST_CASE("search converges on the only winning move in a 3-ply ladder") {
   GameHistory h;
   h.reset(b.hash());
   FakeEvaluator ev(n, 0.0f);  // uniform priors, zero values: only terminal results carry signal
-  SearchTree tree(testParams(3000), n, 9);
+  // The rule of 5.4.10 resolves every move at the cap exactly; the search then still
+  // converges on the winning atari (checked first), but the detailed Q expectations
+  // below describe the plain search of 5.4.4, so the main run switches the rule off.
+  {
+    SearchParams p = testParams(3000);
+    p.resolveTerminalMoves = true;
+    SearchTree resolved(p, n, 9);
+    resolved.newGame(b, h);
+    resolved.runSequential(ev);
+    REQUIRE(resolved.checkInvariants() == "");
+    CHECK(resolved.selectMove(100) == pt(1, 3, n));
+    std::vector<float> piR;
+    resolved.policyTarget(piR);
+    CHECK(piR[pt(1, 3, n)] > 0.5f);
+    for (const Edge& e : resolved.root().edges)
+      if (e.move == pt(1, 3, n)) CHECK(e.Q() > 0.9f);
+  }
+  SearchParams plain = testParams(3000);
+  plain.resolveTerminalMoves = false;
+  SearchTree tree(plain, n, 9);
   tree.newGame(b, h);
   tree.runSequential(ev);
   REQUIRE(tree.checkInvariants() == "");
@@ -622,4 +645,158 @@ TEST_CASE("a failed evaluation leaves no pending node, at the root or inside the
   b.play(m);
   h.push(m, b.hash());
   CHECK_NOTHROW(tree.advance(m, b, h));
+}
+
+// --- game-ending moves (DESIGN 5.4.10, M4 review) --------------------------------------------
+
+namespace {
+
+// Value `valueForBlack` in black's perspective (negated when white is to move); pass
+// prior `passBlack` when black is to move and `passWhite` when white is (board moves 1).
+FakeEvaluator passPriorEvaluator(int n, float valueForBlack, float passBlack, float passWhite) {
+  return FakeEvaluator(n, [=](const uint8_t* planes, float* policy, float* value) {
+    for (int a = 0; a < n * n; ++a) policy[a] = 1.0f;
+    const bool black = blackToMove(planes, n);
+    policy[n * n] = black ? passBlack : passWhite;
+    *value = black ? valueForBlack : -valueForBlack;
+  });
+}
+
+const Edge* rootEdge(const SearchTree& t, Move m) {
+  for (const Edge& e : t.root().edges)
+    if (e.move == m) return &e;
+  return nullptr;
+}
+
+}  // namespace
+
+TEST_CASE("a pass that lets the opponent end the game at a loss is never chosen") {
+  // Black to move, behind if the game ends now (1 black stone, 2 white stones, komi 7.5;
+  // every empty point is neutral). The network believes black is winning (+0.9) and
+  // gives black's pass a large prior but white's pass a tiny one: without the exact
+  // value of white's answering pass the search sees pass -> "white to move, white
+  // losing" (+0.9 for black) and passes; the opponent's pass then ends the game at a loss.
+  const int n = 5;
+  Board b = Board::fromString("X . . . .\n"
+                              ". . . . .\n"
+                              ". . O . .\n"
+                              ". . . . .\n"
+                              ". . . . O\n", 7.5f, Color::Black);
+  REQUIRE(b.score() < 0);
+  REQUIRE(b.consecutivePasses() == 0);
+  GameHistory h;
+  h.reset(b.hash());
+  FakeEvaluator ev = passPriorEvaluator(n, 0.9f, 100.0f, 0.001f);
+  // 20 simulations: fewer than the 25 white replies, so the plain search never reaches
+  // white's answering pass (the 9x9 situation: 82 replies, a few dozen visits).
+  for (bool resolve : {true, false}) {
+    CAPTURE(resolve);
+    SearchParams p = testParams(20);
+    p.resolveTerminalMoves = resolve;
+    SearchTree t(p, n, 1);
+    t.newGame(b, h);
+    t.runSequential(ev);
+    CHECK(t.checkInvariants() == "");
+    const Edge* pass = rootEdge(t, kPass);
+    REQUIRE(pass != nullptr);
+    if (resolve) {
+      // The child after black's pass can be ended by white with a win: its value is +1
+      // for white, so black's pass edge is exactly -1 from its first visit on.
+      REQUIRE(pass->N >= 1);
+      CHECK(pass->Q() == doctest::Approx(-1.0f));
+      REQUIRE(pass->child != nullptr);
+      CHECK(pass->child->nnValue == doctest::Approx(-0.9f));  // the raw network value (white's view) is kept
+      CHECK(pass->child->terminalMoveValue == doctest::Approx(1.0f));
+      CHECK(pass->child->value() == doctest::Approx(1.0f));
+      const Edge* whitePass = nullptr;
+      for (const Edge& e : pass->child->edges)
+        if (e.move == kPass) whitePass = &e;
+      REQUIRE(whitePass != nullptr);
+      CHECK(whitePass->terminalValue == doctest::Approx(1.0f));
+      CHECK(t.selectMove(100) != kPass);
+      // No other root move ends the game: their edges carry no terminal value.
+      for (const Edge& e : t.root().edges)
+        if (e.move != kPass) CHECK_FALSE(e.endsGame());
+      CHECK(t.rootValue() == doctest::Approx(0.9f));  // the root itself has no game-ending move
+    } else {
+      // The blind spot, kept reproducible: the paper's search passes here.
+      CHECK(pass->Q() > 0.5f);
+      CHECK(t.selectMove(100) == kPass);
+    }
+  }
+}
+
+TEST_CASE("a winning pass after the opponent's pass is found despite a tiny prior") {
+  // White just passed; black is ahead if the game ends (2 black stones, 1 white, komi
+  // 0.5). The network thinks black is winning anyway (+0.9 for black, so every board
+  // move looks like +0.9) and gives pass a prior of 1e-4: with FPU 0 the plain search
+  // never tries the pass; the exact +1 makes it the first and best choice.
+  const int n = 5;
+  Board b = Board::fromString("X . . . .\n"
+                              ". . . . .\n"
+                              ". . O . .\n"
+                              ". . . . .\n"
+                              ". . . . X\n", 0.5f, Color::White);
+  b.play(kPass);  // black to move, consecutivePasses == 1
+  REQUIRE(b.toMove() == Color::Black);
+  REQUIRE(b.consecutivePasses() == 1);
+  REQUIRE(b.score() > 0);
+  GameHistory h;
+  h.reset(b.hash());
+  h.push(kPass, b.hash());
+  FakeEvaluator ev = passPriorEvaluator(n, 0.9f, 1e-4f, 1e-4f);
+  for (bool resolve : {true, false}) {
+    CAPTURE(resolve);
+    SearchParams p = testParams(30);
+    p.resolveTerminalMoves = resolve;
+    SearchTree t(p, n, 1);
+    t.newGame(b, h);
+    t.runSequential(ev);
+    CHECK(t.checkInvariants() == "");
+    const Edge* pass = rootEdge(t, kPass);
+    REQUIRE(pass != nullptr);
+    if (resolve) {
+      CHECK(pass->terminalValue == doctest::Approx(1.0f));
+      CHECK(pass->N > 15);  // the exact +1 beats every network-valued move from the first selection on
+      CHECK(pass->Q() == doctest::Approx(1.0f));
+      CHECK(t.selectMove(100) == kPass);
+      CHECK(t.rootValue() == doctest::Approx(1.0f));   // bound: black can end the game with a win
+      CHECK(t.rootNetValue() == doctest::Approx(0.9f));
+      CHECK(t.terminalSimulationsThisMove() == static_cast<int>(pass->N));
+    } else {
+      CHECK(pass->N == 0);  // never explored: FPU 0 below the +0.9 board moves, and a 1e-4 prior
+      CHECK(t.selectMove(100) != kPass);
+      CHECK(t.rootValue() == doctest::Approx(0.9f));
+    }
+  }
+}
+
+TEST_CASE("every move at the move cap is resolved exactly") {
+  // Move cap 3 with two moves played: any move ends the game. Black (1 stone) vs white
+  // (1 stone), komi 0.5: a board move makes black's area 2 vs 1 (+0.5, a win), a pass
+  // ends it at 1 vs 1 (-0.5, a loss). Uniform priors, value 0.
+  const int n = 5;
+  Board b(n, 0.5f, /*moveCap=*/3);
+  b.play(pt(0, 0, n));
+  b.play(pt(4, 4, n));
+  REQUIRE(b.moveCount() == 2);
+  REQUIRE(!b.gameOver());
+  GameHistory h;
+  h.reset(b.hash());
+  FakeEvaluator ev(n, 0.0f);
+  SearchParams p = testParams(40);
+  SearchTree t(p, n, 1);
+  t.newGame(b, h);
+  t.runSequential(ev);
+  CHECK(t.checkInvariants() == "");
+  for (const Edge& e : t.root().edges) {
+    CHECK(e.endsGame());
+    CHECK(e.terminalValue == doctest::Approx(e.move == kPass ? -1.0f : 1.0f));
+    if (e.N > 0) CHECK(e.Q() == doctest::Approx(e.terminalValue));
+  }
+  CHECK(t.terminalSimulationsThisMove() == 40);  // every simulation ended at a terminal child
+  CHECK(rootEdge(t, kPass)->N == 0);
+  CHECK(t.selectMove(100) != kPass);
+  CHECK(t.rootValue() == doctest::Approx(1.0f));
+  CHECK(t.rootNetValue() == doctest::Approx(0.0f));
 }

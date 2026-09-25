@@ -117,13 +117,14 @@ def checkpoint_step(path: str | Path) -> int:
 
 @torch.no_grad()
 def evaluate_dataset(model: AGZNet, ds: ChunkDataset, device: torch.device, batch_size: int = 256,
-                     max_positions: int | None = None) -> dict[str, float]:
-    """Mean value MSE and policy CE over the dataset's indexed positions (no symmetry)."""
+                     max_positions: int | None = None, seed: int = 0) -> dict[str, float]:
+    """Mean value MSE and policy CE over the dataset's indexed positions (no symmetry), or
+    over a seeded random subset of `max_positions` of them."""
     model.eval()
     n_pos = 0
     v_sum = 0.0
     p_sum = 0.0
-    for batch in ds.iterate_all(batch_size):
+    for batch in ds.iterate_all(batch_size, max_positions=max_positions, seed=seed):
         planes = torch.from_numpy(batch["planes"]).to(device)
         pi = torch.from_numpy(batch["pi"]).to(device)
         z = torch.from_numpy(batch["z"]).to(device)
@@ -131,8 +132,6 @@ def evaluate_dataset(model: AGZNet, ds: ChunkDataset, device: torch.device, batc
         v_sum += float(((value - z) ** 2).sum())
         p_sum += float((-(pi * F.log_softmax(logits.float(), dim=1)).sum(dim=1)).sum())
         n_pos += planes.shape[0]
-        if max_positions is not None and n_pos >= max_positions:
-            break
     model.train()
     if n_pos == 0:
         return {"positions": 0, "value_mse": float("nan"), "policy_ce": float("nan")}

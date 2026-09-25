@@ -73,7 +73,10 @@ class SearchTree {
   int terminalSimulationsThisMove() const { return terminalSimulationsThisMove_; }
   uint32_t rootTotalVisits() const { return root_->totalEdgeVisits(); }
   uint32_t inheritedVisits() const { return inheritedVisits_; }
-  float rootValue() const { return root_->nnValue; }         // v(s0), root player's perspective
+  // v(s0) in the root player's perspective, raised to the exact value of a game-ending
+  // move at the root when that is better (DESIGN 5.4.10); rootNetValue() is the raw v(s0).
+  float rootValue() const { return root_->value(); }
+  float rootNetValue() const { return root_->nnValue; }
   float rootMaxQ() const;                                      // max over visited edges, same perspective
   bool shouldResign() const;                                   // both rootValue and rootMaxQ below the threshold
   // Sparse root visit counts (move, N) for every edge with N > 0.
@@ -104,6 +107,7 @@ class SearchTree {
  private:
   void expandInto(Node& node, const Board& board, const HashHistory& hist, const NNOutput& out, int symmetry);
   void makeTerminal(Node& node, const Board& board);
+  void resolveTerminalMoves(Node& node, const Board& board);
   void backup(const std::vector<Edge*>& path, const std::vector<Node*>& nodes, Node& leaf, float leafValue);
   void addRootNoise();
   void resetRoot(const Board& board, const GameHistory& hist);

@@ -2,6 +2,7 @@
 // report. FakeEvaluator only.
 #include <cmath>
 #include <set>
+#include <stdexcept>
 #include <vector>
 
 #include "core/board.h"
@@ -163,6 +164,82 @@ TEST_CASE("match plays every opening twice with colours swapped and scores on pa
   CHECK(j["mean_pair_score"].get<double>() == doctest::Approx(r.meanPairScore));
   CHECK(j["openings"].size() == 5);
   CHECK(j["games_detail"].size() == 10);
+}
+
+TEST_CASE("openings survive a JSON round trip and illegal ones are rejected") {
+  auto ops = generateRandomOpenings(5, 7.5f, 50, 6, 3, 17);
+  ops.push_back(Opening{{kPass, static_cast<Move>(12)}});  // pass is written as n*n, never -1
+  const std::string text = openingsToJson(ops, 5);
+  CHECK(text.find("-1") == std::string::npos);
+  CHECK(text.find("[25,12]") != std::string::npos);
+  auto back = openingsFromJson(text, 5, 7.5f, 50);
+  REQUIRE(back.size() == ops.size());
+  for (size_t i = 0; i < ops.size(); ++i) CHECK(back[i].moves == ops[i].moves);
+  // The report uses the same encoding, so its openings and moves can be fed back in.
+  FakeEvaluator ev(5, 0.0f);
+  MatchPlayer p{&ev, evalParams(4), "p"};
+  MatchReport r = playMatch(p, p, 5, 7.5f, 50, {ops.back()}, 3, 1);
+  nlohmann::json j = nlohmann::json::parse(matchReportToJson(r));
+  CHECK(j["openings"][0] == nlohmann::json({25, 12}));
+  for (const auto& g : j["games_detail"]) {
+    for (int m : g["moves"].get<std::vector<int>>()) {
+      CHECK(m >= 0);
+      CHECK(m <= 25);
+    }
+    CHECK(g["moves"][0] == 25);
+    // The whole game replays as an "opening" (two passes end it, legal throughout).
+    CHECK_NOTHROW(openingsFromJson(nlohmann::json::array({g["moves"]}).dump(), 5, 7.5f, 50));
+  }
+  CHECK_NOTHROW(openingsFromJson(j["openings"].dump(), 5, 7.5f, 50));
+  CHECK_THROWS_AS(openingsFromJson("[[0, 0]]", 5, 7.5f, 50), std::invalid_argument);     // occupied point
+  CHECK_THROWS_AS(openingsFromJson("[[26]]", 5, 7.5f, 50), std::invalid_argument);       // out of range
+  CHECK_THROWS_AS(openingsFromJson("[[0], 3]", 5, 7.5f, 50), std::invalid_argument);     // not an array
+  CHECK_THROWS_AS(openingsFromJson("nope", 5, 7.5f, 50), std::invalid_argument);         // not JSON
+  CHECK(openingsFromJson("[[25, 25]]", 5, 7.5f, 50)[0].moves == std::vector<Move>{kPass, kPass});  // legal (game over)
+}
+
+TEST_CASE("the random anchor plays legal games, is seed-deterministic and loses to a searcher") {
+  const int n = 5;
+  const SearchParams params = evalParams(16);
+  MatchPlayer ra{nullptr, params, "random", true};
+  MatchPlayer rb{nullptr, params, "random", true};
+  auto openings = generateRandomOpenings(n, 7.5f, 50, 4, 2, 5);
+  MatchReport r = playMatch(ra, rb, n, 7.5f, 50, openings, 3, 2);
+  REQUIRE(r.games.size() == 8);
+  for (const MatchGame& g : r.games) {
+    Board bd(n, 7.5f, 50);
+    GameHistory h;
+    h.reset(bd.hash());
+    for (size_t k = 0; k < g.moves.size(); ++k) {
+      const Move m = g.moves[k];
+      REQUIRE(bd.isLegal(m, HashHistory(h)));
+      if (m == kPass && k >= openings[static_cast<size_t>(g.pair)].moves.size()) {
+        // A random side passes only when no board move is legal.
+        std::vector<Move> legal;
+        bd.legalMoves(HashHistory(h), legal);
+        CHECK(legal.size() == 1);
+      }
+      bd.play(m);
+      h.push(m, bd.hash());
+    }
+    CHECK(bd.gameOver());
+    CHECK(g.score == doctest::Approx(bd.score()));
+  }
+  MatchReport again = playMatch(ra, rb, n, 7.5f, 50, openings, 3, 1);
+  for (size_t i = 0; i < r.games.size(); ++i) CHECK(again.games[i].moves == r.games[i].moves);
+  MatchReport other = playMatch(ra, rb, n, 7.5f, 50, openings, 4, 1);
+  bool differs = false;
+  for (size_t i = 0; i < r.games.size(); ++i) differs |= (other.games[i].moves != r.games[i].moves);
+  CHECK(differs);
+  // A (crude) score-aware searcher clearly beats the anchor from both colours; the
+  // crude evaluator with 24 simulations is not perfect on 5x5, so the bar is 0.7.
+  FakeEvaluator strong = scoreAwareEvaluator(n, 7.5f);
+  MatchPlayer s{&strong, evalParams(24), "strong"};
+  MatchReport sv = playMatch(s, rb, n, 7.5f, 50, generateRandomOpenings(n, 7.5f, 50, 6, 2, 8), 21, 3);
+  CHECK(sv.meanPairScore > 0.7);
+  CHECK(sv.nameB == "random");
+  MatchReport vs = playMatch(ra, s, n, 7.5f, 50, generateRandomOpenings(n, 7.5f, 50, 6, 2, 8), 21, 3);
+  CHECK(vs.meanPairScore < 0.3);
 }
 
 TEST_CASE("a score-aware player beats a passive one from both colours") {
