@@ -10,6 +10,8 @@ import math
 from pathlib import Path
 
 import numpy as np
+import time
+
 import pytest
 
 from mango.config import merge_config
@@ -227,6 +229,41 @@ def test_gtp_anchor_entry_only_plays_models(tmp_path):
     assert ladder.entry("gnugo")["command"] == ["gnugo", "--mode", "gtp"]
     with pytest.raises(ValueError):
         ladder.play(ladder.entry("gnugo"), ladder.entry(RANDOM), 0)
+
+
+def test_external_reports_and_fit_place_an_on_demand_player_on_the_ladder_scale(tmp_path):
+    from mango.strength import external_reports, fit_with_external
+
+    ops = [[0, 1], [2, 3]]
+    ladder = {"entries": [{"name": RANDOM, "kind": "random"}, {"name": "m1", "kind": "model"}, {"name": "m2", "kind": "model"}],
+              "matches": [{"a": "m1", "b": RANDOM, "wins_a": 90, "losses_a": 10, "draws_a": 0},
+                          {"a": "m2", "b": RANDOM, "wins_a": 99, "losses_a": 1, "draws_a": 0},
+                          {"a": "m2", "b": "m1", "wins_a": 70, "losses_a": 30, "draws_a": 0}]}
+    d = tmp_path / "gnugo"
+    d.mkdir()
+
+    def report(fname, a, b, wins, losses, sims=200, openings=ops):
+        write_json_atomic(d / fname, {"a": a, "b": b, "wins_a": wins, "losses_a": losses, "draws_a": 0,
+                                      "simulations": sims, "openings": openings})
+    report("m2_old.json", "m2", "gnugo", 10, 90)
+    time.sleep(0.02)
+    report("m2_new.json", "m2", "gnugo", 20, 80)        # newest report per opponent wins
+    report("m1.json", "m1", "gnugo", 0, 100)
+    report("wrong_sims.json", "m1", "gnugo", 50, 50, sims=800)      # different budget: ignored
+    report("wrong_ops.json", "m1", "gnugo", 50, 50, openings=[[5, 6], [7, 8]])  # other openings: ignored
+    report("stranger.json", "zz", "gnugo", 50, 50)      # not a ladder entry: ignored by the fit
+    write_json_atomic(d / "other.json", {"a": "m1", "b": "m2", "wins_a": 1, "losses_a": 0, "draws_a": 0})  # no gnugo
+    write_json_atomic(d / "list.json", [{"a": "m1", "b": "gnugo"}])  # not a report (a list): skipped
+    reps = external_reports(d, "gnugo", ops, 200)
+    assert sorted((r["a"], r["wins_a"]) for r in reps) == [("m1", 0), ("m2", 20), ("zz", 50)]
+    fit = fit_with_external(ladder, reps, "gnugo")
+    r = fit["ratings"]
+    assert set(r) == {RANDOM, "m1", "m2", "gnugo"} and "zz" not in r
+    assert r["gnugo"]["elo"] > r["m2"]["elo"] > r["m1"]["elo"] > r[RANDOM]["elo"] == 0.0
+    assert r["gnugo"]["games"] == 200 and r["m2"]["games"] == 300
+    # The ladder itself is untouched and the fit without the external player is the plain one.
+    assert [e["name"] for e in ladder["entries"]] == [RANDOM, "m1", "m2"] and len(ladder["matches"]) == 3
+    assert external_reports(tmp_path / "missing", "gnugo", ops, 200) == []
 
 
 def _model_dir(path: Path, model_id: str) -> Path:

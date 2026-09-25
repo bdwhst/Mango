@@ -14,6 +14,8 @@ It was **not met on the original measurement** (plain search): the same criterio
 
 **Robust findings:** every ladder entry beats its predecessor head-to-head (58–92 %); iteration 15 beats iteration 1 100–0 and the random anchor 100–0 on the fixed openings; 13 of 15 candidates passed the gate (iterations 2 and 14 rejected at 0.515 and 0.532); every gate and ladder match had 100 % unique trajectories; held-out policy cross-entropy fell 4.34 → 2.97 (uniform = 4.41) and held-out value MSE 0.87 → 0.72 on the moving window.
 
+**External reference (added 2026-09-24):** against GNU Go 3.8 level 10, iteration 15 scores 18–82 at the ladder budget (200 simulations, ≈ −260 Elo) and 30–70 at 800 simulations (≈ −150 Elo); see the GNU Go section. The ladder's 1,925 Elo is a scale over random moves, not a human or engine level.
+
 **Not supported:** "no generalisation gap" (the run's training-sample curve was the oldest chunk of the window, reading 5; the window and the targets move, so held-out loss alone is not a fixed-task measure) and "resignation works" (realised false-positive rate 5–12 %, reading 3).
 
 ## Re-measurement with the search fix (§5.4.10)
@@ -50,11 +52,36 @@ Every consecutive entry still scores above 50 % head-to-head (58–92 % after, 5
 5. **The "Train-sample v_mse" column of this run is not comparable across iterations.** During the run the monitor's training sample was the first 4,096 positions of the index — the oldest chunk in the window, from an older model — which is why it jumps (0.21 at iteration 11). Since the review the sample is a seeded uniform random subset (`ChunkDataset.subset_entries`) and a fixed validation set (`training.fixed_holdout_iteration`, the frozen holdout games of one iteration) is evaluated every iteration; both apply to future runs only, the "Fixed-set" column is empty here.
 6. **Per-iteration ladder log lines are not a curve.** The pipeline logs the new entry's rating at the fit made when it joined (iteration 7: 1,713; iteration 13: 1,663); every later match re-positions everything. `ratings.csv` keeps every fit; a report refits the whole ladder.
 
+## Against GNU Go 3.8, level 10 (external anchor, 2026-09-24)
+
+GNU Go 3.8 (the prebuilt Windows build from gnugo.baduk.org, kept outside the repository in `build/gnugo/`) run as `gnugo --mode gtp --level 10 --chinese-rules --capture-all-dead --play-out-aftermath`, so that it keeps playing until every dead stone is captured and every neutral point filled — the only way a Tromp–Taylor referee (a third `mango_gtp`, no dead-stone judgement) scores its games fairly. Iteration 15 (`0015`) played the ladder's 50 fixed openings with both colours (`play_gtp_match`, DESIGN §6.6), first at the ladder budget and then at four times it:
+
+| Mango budget | Result (W–L) | as black / as white | mean pair score [95 % bootstrap] | Elo vs GNU Go | pairs 2–0 / 1–1 / 0–2 | whole-board losses |
+|---|---|---|---|---|---|---|
+| 200 simulations | **18–82** | 10/50 · 8/50 | 0.18 [0.10, 0.26] | −263 [−382, −182] | 3 / 12 / 35 | 54 |
+| 800 simulations | **30–70** | 11/50 · 19/50 | 0.30 [0.21, 0.39] | −147 [−230, −78] | 4 / 22 / 24 | 41 |
+
+(`strength/gnugo/L10_s200.json`, `L10_s800.json`; Elo from the pair score, `400 log10(p / (1 − p))`.) All 200 games ended by two passes; no resignations, no illegal moves.
+
+**The margins are an artefact, the results are not.** "Whole-board" losses (73.5 or 88.5 points, i.e. every Mango stone captured) are 54 of the 82 losses at 200 simulations. Replaying every game with the referee shows what happens: once the value head judges the game lost, Mango passes at every turn; GNU Go, which does not pass while dead stones remain, captures everything. At Mango's first pass it was already ≥ 10 points behind (Tromp–Taylor count, dead stones counted alive) in 44 of those 54 games, < 10 behind in 7, ahead in 3. So the whole-board margins inflate how badly the games were lost, not how many were lost.
+
+**A real weakness underneath: passing early on an open board.** Mango's first pass came with ≥ 20 empty points in 49 of the 100 games at 200 simulations (median first pass at move 86 with 19 empty points; earliest at move 34 with 49 empty points), and in 23 of those it was ahead on the count at that moment. It went on to lose 10 of these 23 (e.g. game 47: white, pass at move 38 with 46 empty points and every white group unsettled, final 73.5-point loss). In self-play both sides are the same network: a pass made while ahead is answered by a pass, the game ends, the label confirms the pass — so the value head has learnt that "ahead ⇒ passing is safe" and the policy prior on pass is high in won positions. §5.4.10 only makes the *game-ending* pass exact; a first pass against an opponent who plays on is valued by the network. Self-play should correct this over time (the losing side's search finds that continuing beats passing, which then punishes the early pass), but not by iteration 15. Bound on its cost here: ≤ 10 of the 82 losses at 200 simulations; the other losses were decided on the board.
+
+**Budget helps but does not close the gap.** Four times the search moves the score from 0.18 to 0.30 (≈ +115 Elo, intervals overlapping at the edges), mostly as white (8 → 19 of 50), and reduces whole-board losses (54 → 41) and early passes (49 → 38 games with ≥ 20 empty points at the first pass). At 800 simulations 26 of the 38 open-board first passes were made while ahead and 23 of those games were won.
+
+**Reading.** On 9×9 the best model of this run is clearly below GNU Go level 10 at the ladder budget — roughly 260 Elo at 200 simulations, 150 at 800 — which puts the ladder's 1,925 Elo over random into perspective: it is a scale relative to uniformly random moves, not to any human or engine reference. GNU Go is now the external anchor DESIGN §6.6 asked for.
+
+**GNU Go on the ladder scale.** Added to `ladder.json` as the GTP anchor and played, with the ladder's own derived seeds and the same 50 openings, against three entries: `0001` (first promoted) 0–100, `0008` 1–99, `0015` 17–83 (a second, independently seeded sample of the 18–82 above). The Bradley–Terry MAP fit (σ = 350, random = 0) then rates **GNU Go 3.8 level 10 at 2,123 [1,994, 2,251]** against **1,877 [1,773, 1,980] for iteration 15** — 246 Elo apart, in line with the direct-match estimate; the whole ladder shifted down slightly with the three new matches (iteration 15 was 1,925 before). GNU Go's own interval is wide because it is separated from two of its three opponents (0–100, 1–99 carry almost no information) and is held up by the prior and the one informative match. Iterations 17–21 played it inside the pipeline (results in the Continuation section); from iteration 22 GNU Go is measured on demand only (`scripts/vs_gnugo.py`), and its ladder-scale rating comes from that script's refit rather than from `ladder.json`.
+
+## Continuation (from 2026-09-24 evening)
+
+The run was resumed from its state (iteration 16, self-play phase, best model `0015`) with `--hours 8` after the GNU Go anchor matches. Two things differ from iterations 1–15 and are part of the record: (1) self-play now uses the §5.4.10 search (game-ending moves resolved exactly), i.e. the training data from iteration 16 on comes from a slightly different search than before — DESIGN §5.4.10 said "from the next run on"; the user chose to continue this run instead, so iterations ≤ 15 and ≥ 16 are not one homogeneous data-generating process; (2) for iterations 17–21 the ladder had GNU Go 3.8 level 10 as an anchor and every new entry played 100 games against it (`0017` 29–71, `0018` 20–80, `0019` 27–73, `0020` 31–69, `0021` see `strength/gnugo/`); that cost ≈ 12 min of a 26-min iteration (one game per process at batch-1 inference; four parallel trios gave only 1.6×), so from iteration 22 the pipeline no longer plays GNU Go: the entry and its 8 matches were moved out of `ladder.json` into `strength/gnugo/` (`ladder_matches.json`, the reports) and the ladder fit is again the plain one. GNU Go is measured on demand with `scripts/vs_gnugo.py`, which also refits the ladder with the stored GNU Go reports as an extra player. The window (20,000 games) still contains iterations 6–15 data at the restart.
+
 ## Caveats
 
 - The run was restarted once, at the start of iteration 2, to pass `--games-in-flight 128` to the match programs (the gate of iteration 1 took 576 s at the default 32; later gates ≈ 170–200 s). The restart protocol resumed the self-play phase from its plan; only the chunk in progress was regenerated.
 - The match reports of the original ladder (`strength_plain_search/`) were written before the pass-encoding fix (pass = −1 in `games_detail`); the analysis tools use the result and termination fields only. The re-measured reports use the N² encoding.
-- No external engine anchor (GNU Go / KataGo are not installed on this machine); every scale here is relative to the random-move anchor.
+- The ladder scale is relative to the random-move anchor; the GNU Go section above is the only external reference (KataGo is not installed). GNU Go's own games were scored by Mango's referee under Tromp–Taylor rules with `--capture-all-dead`, so its passes are late; the same rule applied to Mango is what produces the whole-board margins.
 - One seed, one run: the §8.2 sweep (c_puct × FPU at equal wall-clock) is prepared (`scripts/sweep_9x9.py`, `python -m mango.strength crossrun`) but was not run; at ≥ 1 GPU-hour per configuration it is an 8+ hour job whose budget is a user decision.
 
 Config: board 9×9, komi 7.5, 200 sims/move, 6×64 net, 2000 games/iteration, window 20000 games, gate 200 pairs > 0.55, ladder 50 pairs. Iterations completed: 15. Best model: `0015-4da2388b`.
@@ -66,20 +93,21 @@ Two fits of the same matches, random anchor = 0, prior σ = 350 Elo, ±1.96 SE (
 | Entry | It | Promoted | Plain Elo | Plain 95 % | Adjusted Elo | Adjusted 95 % | Games | Flags |
 |---|---|---|---|---|---|---|---|---|
 | `random` |  |  | 0 | [0, 0] | 0 | [0, 0] | 1400 |  |
-| `0000-8ebc3d52` | 0 | no | 216 | [156, 277] | 221 | [160, 282] | 500 |  |
-| `0001-b8b3486c` | 1 | yes | 288 | [226, 350] | 295 | [233, 358] | 1400 |  |
-| `0003-82ecb6e4` | 3 | yes | 549 | [478, 620] | 563 | [491, 634] | 600 |  |
-| `0004-9c2c69ea` | 4 | yes | 802 | [723, 882] | 821 | [741, 901] | 700 |  |
-| `0005-8aed0cac` | 5 | yes | 992 | [908, 1076] | 1016 | [932, 1101] | 800 |  |
-| `0006-eb0b1d36` | 6 | yes | 1094 | [1008, 1180] | 1121 | [1034, 1208] | 800 |  |
-| `0007-cca28adf` | 7 | yes | 1309 | [1219, 1400] | 1343 | [1251, 1435] | 800 |  |
-| `0008-26e2377a` | 8 | yes | 1428 | [1335, 1521] | 1465 | [1371, 1560] | 800 |  |
-| `0009-16a40970` | 9 | yes | 1519 | [1424, 1614] | 1560 | [1463, 1657] | 800 |  |
-| `0010-12c7fe30` | 10 | yes | 1582 | [1485, 1678] | 1625 | [1527, 1724] | 800 |  |
-| `0011-3fcfb756` | 11 | yes | 1706 | [1607, 1805] | 1754 | [1653, 1855] | 800 |  |
-| `0012-0cce97c6` | 12 | yes | 1734 | [1633, 1835] | 1784 | [1680, 1887] | 700 |  |
-| `0013-bb09a99e` | 13 | yes | 1823 | [1719, 1926] | 1876 | [1770, 1982] | 600 |  |
-| `0015-4da2388b` | 15 | yes | 1925 | [1818, 2032] | 1983 | [1872, 2093] | 500 |  |
+| `gnugo-3.8-L10` |  |  | 2123 | [1994, 2251] | 2183 | [2051, 2315] | 300 |  |
+| `0000-8ebc3d52` | 0 | no | 207 | [147, 266] | 211 | [151, 271] | 500 |  |
+| `0001-b8b3486c` | 1 | yes | 277 | [216, 338] | 284 | [223, 345] | 1500 |  |
+| `0003-82ecb6e4` | 3 | yes | 533 | [464, 603] | 546 | [476, 616] | 600 |  |
+| `0004-9c2c69ea` | 4 | yes | 781 | [704, 858] | 798 | [720, 876] | 700 |  |
+| `0005-8aed0cac` | 5 | yes | 966 | [885, 1048] | 989 | [907, 1071] | 800 |  |
+| `0006-eb0b1d36` | 6 | yes | 1066 | [983, 1150] | 1091 | [1007, 1176] | 800 |  |
+| `0007-cca28adf` | 7 | yes | 1277 | [1189, 1365] | 1308 | [1219, 1398] | 800 |  |
+| `0008-26e2377a` | 8 | yes | 1392 | [1302, 1483] | 1427 | [1336, 1519] | 900 |  |
+| `0009-16a40970` | 9 | yes | 1483 | [1390, 1575] | 1521 | [1427, 1615] | 800 |  |
+| `0010-12c7fe30` | 10 | yes | 1544 | [1450, 1638] | 1584 | [1489, 1680] | 800 |  |
+| `0011-3fcfb756` | 11 | yes | 1665 | [1569, 1762] | 1710 | [1612, 1809] | 800 |  |
+| `0012-0cce97c6` | 12 | yes | 1693 | [1595, 1791] | 1739 | [1639, 1839] | 700 |  |
+| `0013-bb09a99e` | 13 | yes | 1781 | [1680, 1881] | 1830 | [1727, 1933] | 600 |  |
+| `0015-4da2388b` | 15 | yes | 1877 | [1773, 1980] | 1929 | [1823, 2036] | 600 |  |
 
 ### Prior sensitivity
 
@@ -87,71 +115,71 @@ Final entry, first model entry and iteration-1 entry under different prior width
 
 | Model | σ (Elo) | Final | Iteration 1 | Initial | Monotone | mean \|z\| | max \|z\| |
 |---|---|---|---|---|---|---|---|
-| plain | 200 | 1541 [1457, 1626] | 174 | 118 | yes | 1.35 | 4.5 |
-| plain | 350 | 1925 [1818, 2032] | 288 | 216 | yes | 0.90 | 3.0 |
-| plain | 700 | 2232 [2100, 2365] | 385 | 301 | yes | 0.74 | 4.3 |
-| plain | 1400 | 2360 [2214, 2507] | 427 | 338 | yes | 0.73 | 5.4 |
-| plain | 1000000 | 2413 [2260, 2566] | 445 | 354 | yes | 0.74 | 6.0 |
-| opening-adjusted | 200 | 1573 [1487, 1659] | 176 | 118 | yes | 1.14 | 4.4 |
-| opening-adjusted | 350 | 1983 [1872, 2093] | 295 | 221 | yes | 0.90 | 4.2 |
-| opening-adjusted | 700 | 2319 [2182, 2457] | 399 | 311 | yes | 0.85 | 7.7 |
-| opening-adjusted | 1400 | 2462 [2310, 2615] | 445 | 352 | yes | 0.87 | 9.9 |
-| opening-adjusted | 1000000 | 2522 [2362, 2682] | 465 | 369 | yes | 0.89 | 10.9 |
+| plain | 200 | 1472 [1392, 1552] | 160 | 106 | yes | 1.42 | 4.7 |
+| plain | 350 | 1877 [1773, 1980] | 277 | 207 | yes | 0.91 | 3.1 |
+| plain | 700 | 2210 [2080, 2340] | 379 | 296 | yes | 0.72 | 4.1 |
+| plain | 1400 | 2353 [2208, 2498] | 425 | 336 | yes | 0.70 | 5.3 |
+| plain | 1000000 | 2413 [2260, 2565] | 445 | 354 | yes | 0.71 | 6.0 |
+| opening-adjusted | 200 | 1500 [1418, 1581] | 162 | 107 | yes | 1.16 | 4.6 |
+| opening-adjusted | 350 | 1929 [1823, 2036] | 284 | 211 | yes | 0.90 | 3.8 |
+| opening-adjusted | 700 | 2293 [2158, 2428] | 393 | 306 | yes | 0.84 | 7.4 |
+| opening-adjusted | 1400 | 2453 [2301, 2604] | 443 | 350 | yes | 0.86 | 9.8 |
+| opening-adjusted | 1000000 | 2520 [2361, 2679] | 465 | 369 | yes | 0.87 | 11.0 |
 
 ### Predicted vs observed (plain fit, σ = 350), largest residuals first
 
 | A | B | Games | Predicted score of A | Observed | z |
 |---|---|---|---|---|---|
-| `0007-cca28adf` | `0006-eb0b1d36` | 100 | 0.776 | 0.900 | +3.0 |
-| `0010-12c7fe30` | `0007-cca28adf` | 100 | 0.827 | 0.940 | +3.0 |
-| `0004-9c2c69ea` | `0003-82ecb6e4` | 100 | 0.811 | 0.920 | +2.8 |
-| `0001-b8b3486c` | `random` | 100 | 0.840 | 0.930 | +2.5 |
-| `0008-26e2377a` | `0001-b8b3486c` | 100 | 0.999 | 0.990 | -2.3 |
-| `0000-8ebc3d52` | `random` | 100 | 0.776 | 0.870 | +2.2 |
-| `0009-16a40970` | `0007-cca28adf` | 100 | 0.770 | 0.860 | +2.1 |
-| `0003-82ecb6e4` | `random` | 100 | 0.959 | 1.000 | +2.1 |
-| `0003-82ecb6e4` | `0001-b8b3486c` | 100 | 0.818 | 0.890 | +1.9 |
-| `0006-eb0b1d36` | `0004-9c2c69ea` | 100 | 0.843 | 0.910 | +1.8 |
-| `0004-9c2c69ea` | `0001-b8b3486c` | 100 | 0.951 | 0.990 | +1.8 |
-| `0005-8aed0cac` | `0004-9c2c69ea` | 100 | 0.749 | 0.820 | +1.6 |
+| `0010-12c7fe30` | `0007-cca28adf` | 100 | 0.823 | 0.940 | +3.1 |
+| `0007-cca28adf` | `0006-eb0b1d36` | 100 | 0.771 | 0.900 | +3.1 |
+| `0004-9c2c69ea` | `0003-82ecb6e4` | 100 | 0.806 | 0.920 | +2.9 |
+| `0001-b8b3486c` | `random` | 100 | 0.831 | 0.930 | +2.6 |
+| `0000-8ebc3d52` | `random` | 100 | 0.767 | 0.870 | +2.4 |
+| `0009-16a40970` | `0007-cca28adf` | 100 | 0.765 | 0.860 | +2.2 |
+| `0003-82ecb6e4` | `random` | 100 | 0.956 | 1.000 | +2.2 |
+| `0008-26e2377a` | `0001-b8b3486c` | 100 | 0.998 | 0.990 | -2.1 |
+| `0006-eb0b1d36` | `0004-9c2c69ea` | 100 | 0.838 | 0.910 | +2.0 |
+| `0003-82ecb6e4` | `0001-b8b3486c` | 100 | 0.814 | 0.890 | +2.0 |
+| `0004-9c2c69ea` | `0001-b8b3486c` | 100 | 0.948 | 0.990 | +1.9 |
+| `0005-8aed0cac` | `0004-9c2c69ea` | 100 | 0.744 | 0.820 | +1.7 |
 
 ### Predicted vs observed (opening-adjusted fit, σ = 350), per colour assignment, largest first
 
 | Black | White | Games | Predicted P(black) | Observed | z |
 |---|---|---|---|---|---|
-| `0001-b8b3486c` | `0008-26e2377a` | 50 | 0.001 | 0.020 | +4.2 |
-| `0005-8aed0cac` | `0008-26e2377a` | 50 | 0.061 | 0.180 | +3.5 |
-| `0000-8ebc3d52` | `random` | 50 | 0.736 | 0.920 | +3.0 |
-| `0010-12c7fe30` | `0007-cca28adf` | 50 | 0.797 | 0.960 | +2.9 |
-| `0001-b8b3486c` | `random` | 50 | 0.809 | 0.960 | +2.8 |
-| `0006-eb0b1d36` | `0004-9c2c69ea` | 50 | 0.813 | 0.960 | +2.7 |
-| `0007-cca28adf` | `0006-eb0b1d36` | 50 | 0.737 | 0.900 | +2.7 |
-| `0001-b8b3486c` | `0000-8ebc3d52` | 50 | 0.552 | 0.720 | +2.4 |
-| `0003-82ecb6e4` | `0004-9c2c69ea` | 50 | 0.161 | 0.040 | -2.4 |
-| `0008-26e2377a` | `0005-8aed0cac` | 50 | 0.910 | 1.000 | +2.2 |
-| `0007-cca28adf` | `0009-16a40970` | 50 | 0.195 | 0.080 | -2.1 |
-| `0010-12c7fe30` | `0013-bb09a99e` | 50 | 0.167 | 0.060 | -2.1 |
+| `0001-b8b3486c` | `0008-26e2377a` | 50 | 0.001 | 0.020 | +3.8 |
+| `0005-8aed0cac` | `0008-26e2377a` | 50 | 0.064 | 0.180 | +3.3 |
+| `0000-8ebc3d52` | `random` | 50 | 0.725 | 0.920 | +3.1 |
+| `0010-12c7fe30` | `0007-cca28adf` | 50 | 0.791 | 0.960 | +3.0 |
+| `0001-b8b3486c` | `random` | 50 | 0.799 | 0.960 | +2.9 |
+| `0006-eb0b1d36` | `0004-9c2c69ea` | 50 | 0.807 | 0.960 | +2.8 |
+| `0007-cca28adf` | `0006-eb0b1d36` | 50 | 0.732 | 0.900 | +2.7 |
+| `0001-b8b3486c` | `0000-8ebc3d52` | 50 | 0.549 | 0.720 | +2.5 |
+| `0003-82ecb6e4` | `0004-9c2c69ea` | 50 | 0.165 | 0.040 | -2.4 |
+| `0008-26e2377a` | `0005-8aed0cac` | 50 | 0.905 | 1.000 | +2.3 |
+| `0007-cca28adf` | `0009-16a40970` | 50 | 0.199 | 0.080 | -2.1 |
+| `0010-12c7fe30` | `0013-bb09a99e` | 50 | 0.171 | 0.060 | -2.1 |
 
 ### Opening colour-advantage terms (opening-adjusted fit)
 
-50 openings; 1 with |black advantage| > 200 Elo (11). Largest:
+50 openings; 0 with |black advantage| > 200 Elo (). Largest:
 
 | Opening | Black advantage (Elo) | SE | Games |
 |---|---|---|---|
-| 11 | -207 | 52 | 120 |
-| 48 | -176 | 51 | 120 |
-| 19 | -146 | 51 | 120 |
-| 40 | +146 | 51 | 120 |
-| 8 | -146 | 51 | 120 |
-| 34 | -131 | 51 | 120 |
-| 22 | -117 | 51 | 120 |
-| 9 | -102 | 51 | 120 |
-| 26 | -102 | 51 | 120 |
-| 35 | -102 | 51 | 120 |
+| 11 | -198 | 51 | 126 |
+| 48 | -183 | 50 | 126 |
+| 19 | -154 | 50 | 126 |
+| 40 | +140 | 50 | 126 |
+| 8 | -140 | 50 | 126 |
+| 34 | -126 | 50 | 126 |
+| 9 | -111 | 50 | 126 |
+| 22 | -111 | 50 | 126 |
+| 12 | -97 | 49 | 126 |
+| 35 | -97 | 49 | 126 |
 
 ### Opening-set balance and pair structure
 
-Black won 0.479 of the decided ladder games (0.5 = balanced set). 551 of 3000 pairs were split (the same colour won both games); 0 of 50 openings were split in at least half of their pairs: [].
+Black won 0.479 of the decided ladder games (0.5 = balanced set). 565 of 3150 pairs were split (the same colour won both games); 0 of 50 openings were split in at least half of their pairs: [].
 
 | A | B | Pairs | Both won | Split | Both lost | Draw pairs | Black wins | Score |
 |---|---|---|---|---|---|---|---|---|
@@ -215,6 +243,9 @@ Black won 0.479 of the decided ladder games (0.5 = balanced set). 551 of 3000 pa
 | `0015-4da2388b` | `0013-bb09a99e` | 50 | 22 | 23 | 5 | 0 | 0.37 | 0.670 |
 | `0015-4da2388b` | `0012-0cce97c6` | 50 | 32 | 15 | 3 | 0 | 0.45 | 0.790 |
 | `0015-4da2388b` | `0011-3fcfb756` | 50 | 26 | 22 | 2 | 0 | 0.46 | 0.740 |
+| `0001-b8b3486c` | `gnugo-3.8-L10` | 50 | 0 | 0 | 50 | 0 | 0.50 | 0.000 |
+| `0008-26e2377a` | `gnugo-3.8-L10` | 50 | 0 | 1 | 49 | 0 | 0.51 | 0.010 |
+| `0015-4da2388b` | `gnugo-3.8-L10` | 50 | 2 | 13 | 35 | 0 | 0.43 | 0.170 |
 
 ## Iterations
 

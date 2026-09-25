@@ -743,6 +743,45 @@ def append_ratings_csv(path: Path, fit: dict[str, Any], entries: list[dict[str, 
                         "separated": r["separated"]})
 
 
+def external_reports(directory: str | Path, name: str, openings: list[list[int]] | None,
+                     simulations: int) -> list[dict[str, Any]]:
+    """Match reports under `directory` (JSON, `mango_match` shape) in which `name` played,
+    restricted to those on the given openings and simulation budget so that they are
+    comparable with the ladder's matches (`report_matches` without the seed rule). One
+    report per opponent: the newest file wins."""
+    found: dict[str, tuple[float, dict[str, Any]]] = {}
+    for path in sorted(Path(directory).glob("*.json")):
+        r = read_json(path)
+        if not isinstance(r, dict) or name not in (r.get("a"), r.get("b")) or "wins_a" not in r:
+            continue
+        if simulations > 0 and r.get("simulations") not in (None, 0) and int(r["simulations"]) != int(simulations):
+            continue
+        if openings is not None and [list(map(int, o)) for o in r.get("openings", [])] != openings:
+            continue
+        other = r["b"] if r["a"] == name else r["a"]
+        t = path.stat().st_mtime
+        if other not in found or t > found[other][0]:
+            found[other] = (t, r)
+    return [r for _t, r in found.values()]
+
+
+def fit_with_external(ladder: dict[str, Any], reports: list[dict[str, Any]], name: str,
+                      prior_sigma_elo: float = PRIOR_SIGMA_ELO) -> dict[str, Any]:
+    """The ladder's fit with one external player added from stored reports (played on
+    demand, never by the pipeline). Reports against players that are not ladder entries
+    are ignored; the ladder file is not modified."""
+    players = [e["name"] for e in ladder["entries"]]
+    results = [MatchResult(m["a"], m["b"], int(m["wins_a"]), int(m["losses_a"]), int(m["draws_a"]))
+               for m in ladder["matches"]]
+    known = set(players)
+    for r in reports:
+        other = r["b"] if r["a"] == name else r["a"]
+        if other not in known:
+            continue
+        results.append(MatchResult(r["a"], r["b"], int(r["wins_a"]), int(r["losses_a"]), int(r["draws_a"])))
+    return fit_bradley_terry(players + [name], results, prior_sigma_elo=prior_sigma_elo)
+
+
 def format_ratings(fit: dict[str, Any], entries: list[dict[str, Any]] | None = None) -> str:
     rows = []
     order = [e["name"] for e in entries] if entries else list(fit["ratings"].keys())

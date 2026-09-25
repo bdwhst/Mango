@@ -2,7 +2,7 @@
 
 Keys the C++ side does not read (it ignores unknown keys): search.resign_auto,
 search.resign_select_scope, search.resign_fpr_target, selfplay.evict_old_chunks,
-training.fixed_holdout_iteration, eval.ladder_pairs, eval.ladder_neighbours, eval.gtp_anchor.
+training.fixed_holdout_iteration, eval.ladder_pairs, eval.ladder_neighbours, eval.gtp_anchor, eval.gtp_workers.
 """
 
 from __future__ import annotations
@@ -65,7 +65,9 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "gating": True,
         "ladder_pairs": 50,       # pairs per ladder match (DESIGN 6.6)
         "ladder_neighbours": 3,   # nearest ladder entries a new entry plays
-        "gtp_anchor": None,       # {"name": "gnugo", "command": ["gnugo", "--mode", "gtp", "--chinese-rules"]}
+        "gtp_anchor": None,       # ladder GTP anchor played by the pipeline; keep None: GNU Go is measured on
+                                  # demand by scripts/vs_gnugo.py (DESIGN 6.6), never during training
+        "gtp_workers": 4,         # parallel engine trios for a GTP match (scripts/vs_gnugo.py; games sequential per trio)
     },
 }
 

@@ -33,5 +33,5 @@
     "fixed_holdout_iteration": 5
   },
   "eval": {"pairs": 200, "gate_threshold": 0.55, "opening_moves": 3, "ladder_every": 5, "gating": true,
-           "ladder_pairs": 50, "ladder_neighbours": 3}
+           "ladder_pairs": 50, "ladder_neighbours": 3, "gtp_workers": 4}
 }
