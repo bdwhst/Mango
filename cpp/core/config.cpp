@@ -81,6 +81,11 @@ Config Config::fromJsonText(const std::string& text) {
     get(e, "gating", c.eval.gating);
     get(e, "threads", c.eval.threads);
   }
+  if (j.contains("inference")) {
+    const json& i = j["inference"];
+    get(i, "channels_last", c.inference.channelsLast);
+    get(i, "cuda_graphs", c.inference.cudaGraphs);
+  }
   if (c.board.size < 2 || c.board.size > 19) throw std::invalid_argument("board.size must be in [2, 19]");
   return c;
 }
@@ -136,6 +141,7 @@ std::string Config::toJsonText() const {
                {"ladder_every", eval.ladderEvery},
                {"gating", eval.gating},
                {"threads", eval.threads}};
+  j["inference"] = {{"channels_last", inference.channelsLast}, {"cuda_graphs", inference.cudaGraphs}};
   return j.dump(2);
 }
 

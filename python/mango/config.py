@@ -74,6 +74,10 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "gtp_workers": 4,         # parallel engine trios for a GTP match (scripts/vs_gnugo.py; games sequential per trio)
         "threads": 1,  # search threads of mango_match (1 = the first-version driver), DESIGN 5.5.1
     },
+    "inference": {  # the CUDA fast path of the C++ evaluator (DESIGN 5.3); ignored on MPS and CPU
+        "channels_last": True,
+        "cuda_graphs": True,
+    },
 }
 
 

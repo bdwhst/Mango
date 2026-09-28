@@ -41,12 +41,14 @@ int main(int argc, char** argv) {
     mango::TorchEvaluator::Options o;
     o.device = opt.device;
     o.fp16 = !opt.fp32;
+    o.channelsLast = base.inference.channelsLast && !opt.noChannelsLast;
+    o.cudaGraphs = base.inference.cudaGraphs && !opt.noCudaGraphs;
     auto ev = std::make_unique<mango::TorchEvaluator>(opt.model, o);
     mango::GtpSetup s = mango::resolveGtpSetup(opt, base, &ev->meta());
     mango::SearchParams params =
         mango::SearchParams::fromConfig(s.config.search, s.config.board.size, /*selfplay=*/false);
-    std::cerr << "mango_gtp: model " << ev->modelId() << " on " << ev->deviceName()
-              << (ev->isHalf() ? " (fp16)" : " (fp32)") << ", " << params.simulations << " simulations/move\n";
+    std::cerr << "mango_gtp: model " << ev->modelId() << " on " << ev->description() << ", " << params.simulations
+              << " simulations/move\n";
     auto player = std::make_unique<mango::MctsPlayer>(*ev, params, opt.seed, "mango " + ev->modelId());
     mango::GtpEngine engine(std::move(player), s.config.board.size, s.config.board.komi, s.modelKomi);
     return engine.run(std::cin, std::cout);

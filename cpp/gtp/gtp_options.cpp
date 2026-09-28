@@ -40,6 +40,10 @@ bool GtpOptions::parse(int argc, const char* const* argv, GtpOptions* out, std::
       o.configPath = v;
     } else if (a == "--fp32") {
       o.fp32 = true;
+    } else if (a == "--no-channels-last") {
+      o.noChannelsLast = true;
+    } else if (a == "--no-cuda-graphs") {
+      o.noCudaGraphs = true;
     } else if (a == "--allow-komi-mismatch") {
       o.allowKomiMismatch = true;
     } else if (a == "--help" || a == "-h") {

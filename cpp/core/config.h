@@ -69,12 +69,19 @@ struct EvalConfig {
   int threads = 1;  // search threads of the match driver (1 = the first-version driver), DESIGN 5.5.1
 };
 
+// The CUDA fast path of the evaluator (DESIGN 5.3, M4a step 2); ignored on MPS and CPU.
+struct InferenceConfig {
+  bool channelsLast = true;  // channels-last parameters and input
+  bool cudaGraphs = true;    // one CUDA graph per batch bucket
+};
+
 struct Config {
   BoardConfig board;
   SearchConfig search;
   SelfplayConfig selfplay;
   TrainingConfig training;
   EvalConfig eval;
+  InferenceConfig inference;
 
   static Config load(const std::string& path);
   static Config fromJsonText(const std::string& text);

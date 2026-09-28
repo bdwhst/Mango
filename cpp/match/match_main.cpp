@@ -1,7 +1,7 @@
 // mango_match: colour-swapped pairs between two model directories (DESIGN 5.8).
 //   mango_match --a DIR|random --b DIR|random --config CFG --pairs N [--sims S] [--seed S]
 //               [--openings K] [--openings-file F] [--out report.json] [--device D] [--fp32]
-//               [--games-in-flight G] [--threads T] [--max-batch B]
+//               [--games-in-flight G] [--threads T] [--max-batch B] [--no-channels-last] [--no-cuda-graphs]
 //   mango_match --write-openings F --config CFG --pairs N [--openings K] [--seed S]
 // "random" is the ladder's uniform-random legal-move anchor (DESIGN 6.6). With
 // --openings-file the opening set is read from F (written by --write-openings or taken
@@ -24,7 +24,7 @@ int main(int argc, char** argv) {
   std::string a, b, configPath, outPath, openingsFile, writeOpenings, device = "auto";
   int pairs = -1, sims = -1, openingMoves = -1, gamesInFlight = 32, threads = -1, maxBatch = 0;
   uint64_t seed = 1;
-  bool fp32 = false;
+  bool fp32 = false, noChannelsLast = false, noCudaGraphs = false;
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
     auto next = [&]() -> std::string {
@@ -49,6 +49,8 @@ int main(int argc, char** argv) {
     else if (arg == "--max-batch") maxBatch = std::atoi(next().c_str());
     else if (arg == "--device") device = next();
     else if (arg == "--fp32") fp32 = true;
+    else if (arg == "--no-channels-last") noChannelsLast = true;
+    else if (arg == "--no-cuda-graphs") noCudaGraphs = true;
     else {
       std::cerr << "unknown option " << arg << "\n";
       return 2;
@@ -98,17 +100,19 @@ int main(int argc, char** argv) {
     mango::TorchEvaluator::Options o;
     o.device = device;
     o.fp16 = !fp32;
+    o.channelsLast = cfg.inference.channelsLast && !noChannelsLast;
+    o.cudaGraphs = cfg.inference.cudaGraphs && !noCudaGraphs;
     if (a != "random") {
       evA = std::make_unique<mango::TorchEvaluator>(a, o);
       evA->meta().validate(cfg.board);
       pa = mango::MatchPlayer{evA.get(), evalParams, evA->modelId(), false};
-      deviceName = evA->deviceName();
+      deviceName = evA->description();
     }
     if (b != "random") {
       evB = std::make_unique<mango::TorchEvaluator>(b, o);
       evB->meta().validate(cfg.board);
       pb = mango::MatchPlayer{evB.get(), evalParams, evB->modelId(), false};
-      deviceName = evB->deviceName();
+      deviceName = evB->description();
     }
 #else
     if (a != "random" || b != "random") {

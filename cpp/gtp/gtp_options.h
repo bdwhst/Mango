@@ -21,6 +21,8 @@ struct GtpOptions {
   std::string configPath;
   int sims = -1;                 // <=0: from config
   bool fp32 = false;
+  bool noChannelsLast = false;   // switch the CUDA fast path off (DESIGN 5.3)
+  bool noCudaGraphs = false;
   bool allowKomiMismatch = false;
   bool help = false;
 

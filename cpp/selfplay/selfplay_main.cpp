@@ -2,7 +2,7 @@
 //   mango_selfplay --model DIR --config CFG --games N --out DIR [--chunk-prefix P]
 //                  [--chunk-id-start K] [--seed S] [--sgf-dir DIR] [--device D] [--fp32]
 //                  [--iteration I] [--games-in-flight G] [--resign-threshold T]
-//                  [--threads T] [--max-batch B]
+//                  [--threads T] [--max-batch B] [--no-channels-last] [--no-cuda-graphs]
 // --threads / --max-batch override selfplay.threads / selfplay.max_batch (DESIGN 5.5.1).
 // --resign-threshold overrides search.resign_threshold (the pipeline passes the value
 // selected per iteration, DESIGN 5.4.7; -1 disables resignation).
@@ -32,7 +32,7 @@ int main(int argc, char** argv) {
   std::string model, configPath, outDir, sgfDir, device = "auto", chunkPrefix = "chunk_";
   int games = -1, iteration = 0, gamesInFlight = -1, threads = -1, maxBatch = -1;
   uint64_t chunkIdStart = 0, seed = 1;
-  bool fp32 = false;
+  bool fp32 = false, noChannelsLast = false, noCudaGraphs = false;
   bool haveResign = false;
   float resignThreshold = -1.0f;
   for (int i = 1; i < argc; ++i) {
@@ -62,6 +62,8 @@ int main(int argc, char** argv) {
       haveResign = true;
     }
     else if (a == "--fp32") fp32 = true;
+    else if (a == "--no-channels-last") noChannelsLast = true;
+    else if (a == "--no-cuda-graphs") noCudaGraphs = true;
     else {
       std::cerr << "unknown option " << a << "\n";
       return 2;
@@ -81,6 +83,8 @@ int main(int argc, char** argv) {
     mango::TorchEvaluator::Options o;
     o.device = device;
     o.fp16 = !fp32;
+    o.channelsLast = cfg.inference.channelsLast && !noChannelsLast;
+    o.cudaGraphs = cfg.inference.cudaGraphs && !noCudaGraphs;
     mango::TorchEvaluator ev(model, o);
     ev.meta().validate(cfg.board, /*allowKomiMismatch=*/false);
     fs::create_directories(outDir);
@@ -106,7 +110,7 @@ int main(int argc, char** argv) {
     base.moveCap = cfg.board.effectiveMoveCap();
     base.params = mango::SearchParams::fromConfig(cfg.search, cfg.board.size, /*selfplay=*/true);
 
-    std::cerr << "mango_selfplay: model " << ev.modelId() << " on " << ev.deviceName() << (ev.isHalf() ? " (fp16)" : " (fp32)")
+    std::cerr << "mango_selfplay: model " << ev.modelId() << " on " << ev.description()
               << ", " << base.params.simulations << " sims/move, " << games << " games, " << G << " in flight, " << T
               << " search thread(s), max batch " << (B <= 0 ? G : B) << ", resign "
               << (base.params.resignThreshold <= -1.0f ? std::string("off") : std::to_string(base.params.resignThreshold))
@@ -184,6 +188,10 @@ int main(int argc, char** argv) {
     summary["next_chunk_id"] = chunkId;
     summary["model_id"] = ev.modelId();
     summary["device"] = ev.deviceName() + (ev.isHalf() ? " fp16" : " fp32");
+    summary["channels_last"] = ev.channelsLast();
+    summary["cuda_graphs"] = ev.cudaGraphs();
+    summary["graphs_captured"] = ev.graphsCaptured();
+    summary["graph_replays"] = ev.graphReplays();
     summary["iteration"] = iteration;
     std::cout << summary.dump() << "\n";
     std::cerr << "mango_selfplay: " << st.games << " games, " << st.positions << " positions in " << st.seconds << " s ("
