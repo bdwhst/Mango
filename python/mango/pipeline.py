@@ -460,12 +460,15 @@ class Pipeline:
         """The self-play executable (tests substitute a fake driver here)."""
         return [self.exe("mango_selfplay")]
 
-    def _selfplay_args(self, plan: dict[str, Any], it: int, games: int, chunk_id_start: int, seed: int) -> list[Any]:
+    def _selfplay_args(self, plan: dict[str, Any], it: int, games: int, chunk_id_start: int, seed: int,
+                       worker: int | None = None) -> list[Any]:
+        # Driver profile with its per-second timeline (DESIGN 5.5.1); a relaunch overwrites it.
+        profile = self.run / "logs" / "selfplay_profile" / (f"{it:04d}.json" if worker is None else f"{it:04d}_k{worker}.json")
         return self._selfplay_command() + [
             "--model", self.model_dir(plan["model_id"]), "--config", self.run / "config.json", "--games", games, "--out",
             self.run / "replay", "--chunk-prefix", plan["chunk_prefix"], "--chunk-id-start", chunk_id_start, "--seed", seed,
             "--sgf-dir", self.run / "sgf" / f"{it:04d}", "--iteration", it, "--device", self.selfplay_device,
-            "--resign-threshold", plan["v_resign"]]
+            "--resign-threshold", plan["v_resign"], "--profile-out", profile]
 
     def _selfplay_single(self, plan: dict[str, Any], it: int) -> None:
         """selfplay.processes = 1: one process for the games not yet published (M4 path)."""
@@ -486,6 +489,12 @@ class Pipeline:
         self.log(f"selfplay: {summary['games']} games, {summary['positions']} positions, "
                  f"avg length {summary['avg_game_length']:.1f}, {summary['terminations']}, "
                  f"resign {plan['v_resign']:g}, {summary['seconds']}s")
+        pr = summary.get("profile")
+        if pr:
+            ev = pr.get("evaluator", {})
+            self.log(f"selfplay profile: evaluation thread busy {pr['eval_busy']:.2f} ({ev.get('us_per_call', 0):.0f} us per "
+                     f"call, avg batch {summary.get('avg_batch', 0):.0f}, {pr['rounds_per_batch']:.2f} rounds per forward), "
+                     f"search threads busy {pr['search_busy']:.2f}")
         self.state.setdefault("selfplay_stats", {})[str(it)] = summary
 
     def _selfplay_workers(self, plan: dict[str, Any], it: int) -> None:
@@ -500,7 +509,7 @@ class Pipeline:
             if remaining <= 0:
                 continue
             start = max((h.chunk_id for h in mine), default=w["chunk_id_start"] - 1) + 1
-            launches.append((int(w["k"]), self._selfplay_args(plan, it, remaining, start, int(w["seed"]))))
+            launches.append((int(w["k"]), self._selfplay_args(plan, it, remaining, start, int(w["seed"]), int(w["k"]))))
         resumed = bool(headers)  # a restart: earlier launches of this phase published these
         summary: dict[str, Any] = {"processes": len(plan["workers"])}
         if launches:

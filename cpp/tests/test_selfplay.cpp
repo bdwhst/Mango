@@ -514,3 +514,81 @@ TEST_CASE("threaded self-play retries a failed forward with identical requests a
   }
   CHECK(Node::liveCount().load() == liveBefore);
 }
+
+// ---------------------------------------------------------------------------------
+// Driver profile (DESIGN 5.5.1): counters only. Every forward is in the histogram and the
+// timeline exactly once; the time buckets are non-negative and fit in the wall time of the
+// threads that accumulate them.
+TEST_CASE("driver profile: histogram bins") {
+  CHECK(DriverProfile::histogramBin(1) == 0);
+  CHECK(DriverProfile::histogramBin(2) == 1);
+  CHECK(DriverProfile::histogramBin(3) == 1);
+  CHECK(DriverProfile::histogramBin(4) == 2);
+  CHECK(DriverProfile::histogramBin(1023) == 9);
+  CHECK(DriverProfile::histogramBin(1024) == 10);
+  CHECK(DriverProfile::histogramBin(8191) == 12);
+  CHECK(DriverProfile::histogramBin(8192) == 13);  // the last bin is open
+  CHECK(DriverProfile::histogramBin(1000000) == 13);
+}
+
+TEST_CASE("driver profile accounts for every forward and fits in the wall time") {
+  const int n = 5;
+  struct Cfg {
+    int threads, G, maxBatch;
+  };
+  for (const Cfg c : {Cfg{1, 3, 0}, Cfg{3, 6, 0}, Cfg{2, 6, 2}}) {
+    CAPTURE(c.threads);
+    CAPTURE(c.G);
+    CAPTURE(c.maxBatch);
+    FakeEvaluator ev = colorValueEvaluator(n, 0.1f);
+    BatchedSelfplay driver(ev, c.G, "m", c.threads, c.maxBatch);
+    const BatchStats st = driver.run(
+        9, [&](int i) { return optionsFor(n, 10, 900 + i, true); }, [&](int, SelfplayGameResult&&) {});
+    const DriverProfile& pf = st.profile;
+    REQUIRE(st.batches > 0);
+    CHECK(pf.searchThreads == c.threads);
+
+    uint64_t batches = 0, evaluations = 0;
+    for (int i = 0; i < DriverProfile::kHistogramBins; ++i) {
+      const uint64_t b = pf.histBatches[static_cast<size_t>(i)], e = pf.histEvaluations[static_cast<size_t>(i)];
+      batches += b;
+      evaluations += e;
+      CHECK(e >= b * (uint64_t{1} << i));  // every forward of bin i has at least 2^i requests
+      if (i + 1 < DriverProfile::kHistogramBins) CHECK(e <= b * ((uint64_t{2} << i) - 1));
+    }
+    CHECK(batches == st.batches);
+    CHECK(evaluations == st.evaluations);
+
+    batches = evaluations = 0;
+    for (const DriverProfile::TimelineBin& b : pf.timeline) {
+      batches += b.batches;
+      evaluations += b.evaluations;
+      CHECK(b.activeGamesSum >= b.batches);  // a forward carries a leaf of at least one live game
+      CHECK(b.activeGamesSum <= b.batches * static_cast<uint64_t>(c.G));
+    }
+    CHECK(batches == st.batches);
+    CHECK(evaluations == st.evaluations);
+    CHECK(pf.timeline.size() <= static_cast<size_t>(st.seconds / DriverProfile::kTimelineBinSeconds) + 1);
+
+    const double eps = 1e-6;
+    for (double s : {pf.searchCollectSeconds, pf.searchCommitSeconds, pf.searchCallbackSeconds, pf.searchWaitSeconds,
+                     pf.evalWaitSeconds, pf.evalHandbackSeconds, st.evalSeconds})
+      CHECK(s >= -eps);
+    CHECK(pf.searchCollectSeconds + pf.searchCommitSeconds + pf.searchCallbackSeconds + pf.searchWaitSeconds <=
+          c.threads * st.seconds + eps);
+    CHECK(pf.roundsInBatches >= st.batches);
+    if (c.threads == 1) {
+      // One thread does everything in turn: its buckets and the evaluator call fit in the wall time.
+      CHECK(pf.rounds == st.batches);
+      CHECK(pf.roundsInBatches == st.batches);
+      CHECK(pf.searchWaitSeconds == 0.0);
+      CHECK(pf.evalWaitSeconds == 0.0);
+      CHECK(pf.searchCollectSeconds + pf.searchCommitSeconds + pf.searchCallbackSeconds + st.evalSeconds <= st.seconds + eps);
+    } else {
+      CHECK(pf.evalWaitSeconds + st.evalSeconds + pf.evalHandbackSeconds <= st.seconds + eps);
+      if (c.maxBatch == 0) CHECK(pf.roundsInBatches == pf.rounds);  // no round is split
+      else CHECK(pf.roundsInBatches >= pf.rounds);
+    }
+  }
+}
+

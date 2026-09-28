@@ -1,9 +1,12 @@
 #include "nn/torch_evaluator.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <iostream>
 #include <map>
+#include <mutex>
+#include <shared_mutex>
 #include <stdexcept>
 
 #ifdef MANGO_CUDA_GRAPHS
@@ -26,6 +29,15 @@ namespace {
 // midpoints from 32 on, so padding wastes at most a third of a forward.
 const int kBuckets[] = {1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096};
 
+// Process-wide: every evaluator holds it shared while it uses the GPU (construction,
+// evaluate, destruction) and a graph capture holds it exclusively. PyTorch captures in
+// the global mode, in which a CUDA call of any other thread during the capture
+// invalidates it — a real race as soon as evaluators are used from two threads at once.
+std::shared_mutex& cudaWorkMutex() {
+  static std::shared_mutex m;
+  return m;
+}
+
 }  // namespace
 
 struct TorchEvaluator::Impl {
@@ -38,6 +50,7 @@ struct TorchEvaluator::Impl {
   bool graphs = false;
   int warmup = 3;
   uint64_t replays = 0;
+  TorchEvaluator::Timings timings;
 
   struct Bucket {
     int size = 0;
@@ -139,6 +152,7 @@ int TorchEvaluator::bucketFor(int batch) {
 
 TorchEvaluator::TorchEvaluator(const std::string& modelDir, const Options& options)
     : meta_(ModelMeta::load(modelDir)), impl_(std::make_unique<Impl>()) {
+  std::shared_lock<std::shared_mutex> gpuWork(cudaWorkMutex());
   std::string dev = options.device;
   if (dev == "auto") {
     if (cudaAvailable()) dev = "cuda";
@@ -188,13 +202,17 @@ TorchEvaluator::TorchEvaluator(const std::string& modelDir, const Options& optio
   }
 }
 
-TorchEvaluator::~TorchEvaluator() = default;
+TorchEvaluator::~TorchEvaluator() {
+  std::shared_lock<std::shared_mutex> gpuWork(cudaWorkMutex());
+  impl_.reset();
+}
 
 std::string TorchEvaluator::deviceName() const { return impl_->device.str(); }
 bool TorchEvaluator::isHalf() const { return impl_->dtype == torch::kHalf; }
 bool TorchEvaluator::channelsLast() const { return impl_->channelsLast; }
 bool TorchEvaluator::cudaGraphs() const { return impl_->graphs; }
 uint64_t TorchEvaluator::graphReplays() const { return impl_->replays; }
+const TorchEvaluator::Timings& TorchEvaluator::timings() const { return impl_->timings; }
 int TorchEvaluator::graphsCaptured() const {
   int n = 0;
   for (const auto& [size, b] : impl_->buckets) n += b.captured ? 1 : 0;
@@ -215,6 +233,11 @@ void TorchEvaluator::evaluate(const std::vector<NNInput>& in, std::vector<NNOutp
   if (batch == 0) return;
 
   c10::InferenceMode guard;
+  std::shared_lock<std::shared_mutex> gpuWork(cudaWorkMutex());
+  using clock = std::chrono::steady_clock;
+  const auto t0 = clock::now();
+  auto t1 = t0;  // end of packing
+  Impl::Bucket* toCapture = nullptr;
   const size_t per = static_cast<size_t>(kNumPlanes) * nn;
   torch::Tensor packed;  // [>= batch, nn + 2] fp32 on the CPU: logits, then the value
   const int bucketSize = impl_->graphs ? bucketFor(static_cast<int>(batch)) : 0;
@@ -222,6 +245,7 @@ void TorchEvaluator::evaluate(const std::vector<NNInput>& in, std::vector<NNOutp
     Impl::Bucket& b = impl_->bucket(bucketSize);
     uint8_t* dst = b.host.data_ptr<uint8_t>();
     for (int64_t i = 0; i < batch; ++i) std::memcpy(dst + i * per, in[i].planes, per);
+    t1 = clock::now();
     if (b.captured) {
 #ifdef MANGO_CUDA_GRAPHS
       b.staticIn.copy_(b.host);
@@ -232,15 +256,17 @@ void TorchEvaluator::evaluate(const std::vector<NNInput>& in, std::vector<NNOutp
     } else {
       // The bucket's shape through the plain path until the JIT and cuDNN have settled.
       packed = impl_->forwardPacked(b.host.to(impl_->device)).to(torch::kCPU);
-      if (++b.plainCalls >= impl_->warmup) impl_->capture(b);
+      if (++b.plainCalls >= impl_->warmup) toCapture = &b;  // captured at the end, exclusively
     }
   } else {
     torch::Tensor host = torch::empty({batch, kNumPlanes, n, n}, torch::kUInt8);
     uint8_t* dst = host.data_ptr<uint8_t>();
     for (int64_t i = 0; i < batch; ++i) std::memcpy(dst + i * per, in[i].planes, per);
+    t1 = clock::now();
     packed = impl_->forwardPacked(host.to(impl_->device, /*non_blocking=*/false)).to(torch::kCPU);
   }
   packed = packed.contiguous();
+  const auto t2 = clock::now();
   if (packed.size(0) < batch || packed.size(1) != nn + 2) throw std::runtime_error("unexpected output shapes from model");
 
   // fp32 softmax on the CPU (DESIGN 5.3): even a half model cannot underflow priors to 0 here.
@@ -260,6 +286,21 @@ void TorchEvaluator::evaluate(const std::vector<NNInput>& in, std::vector<NNOutp
     const float inv = static_cast<float>(1.0 / sum);
     for (int a = 0; a < na; ++a) out[i].policy[a] *= inv;
     out[i].value = row[na];
+  }
+  Timings& tm = impl_->timings;
+  tm.calls += 1;
+  tm.rows += static_cast<uint64_t>(batch);
+  tm.paddedRows += static_cast<uint64_t>(bucketSize > 0 ? bucketSize : batch);
+  tm.packSeconds += std::chrono::duration<double>(t1 - t0).count();
+  tm.deviceSeconds += std::chrono::duration<double>(t2 - t1).count();
+  tm.unpackSeconds += std::chrono::duration<double>(clock::now() - t2).count();
+  if (toCapture != nullptr) {
+    // A capture must not overlap any other CUDA work of the process (another evaluator's
+    // forward on another thread invalidates it): wait until every evaluator is between
+    // calls.
+    gpuWork.unlock();
+    std::unique_lock<std::shared_mutex> exclusive(cudaWorkMutex());
+    impl_->capture(*toCapture);
   }
 }
 

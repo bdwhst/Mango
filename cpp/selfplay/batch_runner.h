@@ -9,6 +9,7 @@
 // driver, unchanged.
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -21,6 +22,35 @@
 
 namespace mango {
 
+// Where the driver's time goes (DESIGN 5.5.1, "Driver profile"). Counters only: nothing
+// the driver does depends on them. Search-side seconds are summed over the search threads.
+struct DriverProfile {
+  static constexpr int kHistogramBins = 14;  // bin i: forwards of [2^i, 2^(i+1)) requests; the last bin is open
+  static constexpr double kTimelineBinSeconds = 1.0;
+  struct TimelineBin {
+    uint64_t batches = 0;
+    uint64_t evaluations = 0;
+    uint64_t activeGamesSum = 0;  // games in flight, summed over the bin's forwards
+  };
+
+  int searchThreads = 0;
+  double searchCollectSeconds = 0.0;   // selection up to the pending leaves, moves, game ends (callbacks excluded)
+  double searchCommitSeconds = 0.0;    // commit + backup of the results
+  double searchWaitSeconds = 0.0;      // T > 1: blocked in submitRound until the round's results are in
+  double searchCallbackSeconds = 0.0;  // game start / onGameDone (chunk writer), lock wait included
+  uint64_t rounds = 0;                 // T > 1: rounds submitted; T = 1: steps
+  double evalWaitSeconds = 0.0;        // T > 1: evaluation thread idle, waiting for requests
+  double evalHandbackSeconds = 0.0;    // T > 1: evaluation thread outside evaluate(): request list, results, wake-up
+  uint64_t roundsInBatches = 0;        // summed over forwards: rounds (threads) a forward carried requests of
+  std::array<uint64_t, kHistogramBins> histBatches{};
+  std::array<uint64_t, kHistogramBins> histEvaluations{};
+  std::vector<TimelineBin> timeline;  // kTimelineBinSeconds per bin from the start of run()
+
+  static int histogramBin(size_t batch);
+  // One forward of `size` requests, finished `atSeconds` after the start, `activeGames` in flight.
+  void recordBatch(size_t size, double atSeconds, int activeGames);
+};
+
 struct BatchStats {
   int games = 0;
   uint64_t positions = 0;
@@ -29,6 +59,7 @@ struct BatchStats {
   uint64_t retries = 0;       // evaluator failures retried
   double seconds = 0.0;       // wall clock of run()
   double evalSeconds = 0.0;   // inside evaluate()
+  DriverProfile profile;
   double avgBatch() const { return batches ? static_cast<double>(evaluations) / static_cast<double>(batches) : 0.0; }
 };
 

@@ -3,11 +3,16 @@
 //                  [--chunk-id-start K] [--seed S] [--sgf-dir DIR] [--device D] [--fp32]
 //                  [--iteration I] [--games-in-flight G] [--resign-threshold T]
 //                  [--threads T] [--max-batch B] [--no-channels-last] [--no-cuda-graphs]
+//                  [--profile-out FILE]
 // --threads / --max-batch override selfplay.threads / selfplay.max_batch (DESIGN 5.5.1).
+// The summary carries a `profile` object (where the time goes, DESIGN 5.5.1 "Driver
+// profile"); --profile-out writes it with the per-second timeline to FILE.
 // --resign-threshold overrides search.resign_threshold (the pipeline passes the value
 // selected per iteration, DESIGN 5.4.7; -1 disables resignation).
 // Publishes chunks of config selfplay.chunk_games games (atomic rename) and prints a
 // JSON summary line (games, positions, evaluations, timing) to stdout on completion.
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -28,8 +33,68 @@
 
 namespace fs = std::filesystem;
 
+namespace {
+
+#ifdef MANGO_WITH_TORCH
+double round3(double x) { return std::round(x * 1000.0) / 1000.0; }
+
+// The `profile` object of the summary (DESIGN 5.5.1, "Driver profile"). Busy fractions are
+// of the wall time of the driver; the search one is averaged over the search threads.
+nlohmann::json profileJson(const mango::BatchStats& st, const mango::TorchEvaluator::Timings& tm) {
+  const mango::DriverProfile& pf = st.profile;
+  const double wall = std::max(st.seconds, 1e-9);
+  const int threads = std::max(pf.searchThreads, 1);
+  nlohmann::json p;
+  p["search_threads"] = pf.searchThreads;
+  p["search_collect_s"] = round3(pf.searchCollectSeconds);
+  p["search_commit_s"] = round3(pf.searchCommitSeconds);
+  p["search_callback_s"] = round3(pf.searchCallbackSeconds);
+  p["search_wait_s"] = round3(pf.searchWaitSeconds);
+  p["search_busy"] = round3((pf.searchCollectSeconds + pf.searchCommitSeconds + pf.searchCallbackSeconds) / (wall * threads));
+  p["rounds"] = pf.rounds;
+  p["eval_wait_s"] = round3(pf.evalWaitSeconds);
+  p["eval_call_s"] = round3(st.evalSeconds);
+  p["eval_handback_s"] = round3(pf.evalHandbackSeconds);
+  p["eval_busy"] = round3((st.evalSeconds + pf.evalHandbackSeconds) / wall);
+  p["rounds_per_batch"] = st.batches ? round3(static_cast<double>(pf.roundsInBatches) / static_cast<double>(st.batches)) : 0.0;
+  p["evaluator"] = {{"calls", tm.calls},
+                    {"rows", tm.rows},
+                    {"padded_rows", tm.paddedRows},
+                    {"pack_s", round3(tm.packSeconds)},
+                    {"device_s", round3(tm.deviceSeconds)},
+                    {"unpack_s", round3(tm.unpackSeconds)},
+                    {"us_per_call", tm.calls ? round3(1e6 * (tm.packSeconds + tm.deviceSeconds + tm.unpackSeconds) /
+                                                      static_cast<double>(tm.calls))
+                                             : 0.0}};
+  nlohmann::json hist = nlohmann::json::array();
+  for (int i = 0; i < mango::DriverProfile::kHistogramBins; ++i) {
+    if (pf.histBatches[static_cast<size_t>(i)] == 0) continue;
+    const bool last = i + 1 == mango::DriverProfile::kHistogramBins;
+    hist.push_back({{"from", uint64_t{1} << i},
+                    {"to", last ? nlohmann::json(nullptr) : nlohmann::json((uint64_t{2} << i) - 1)},
+                    {"batches", pf.histBatches[static_cast<size_t>(i)]},
+                    {"evaluations", pf.histEvaluations[static_cast<size_t>(i)]}});
+  }
+  p["batch_histogram"] = hist;
+  return p;
+}
+
+// Per-second rows [second, forwards, evaluations, average games in flight].
+nlohmann::json timelineJson(const mango::DriverProfile& pf) {
+  nlohmann::json rows = nlohmann::json::array();
+  for (size_t t = 0; t < pf.timeline.size(); ++t) {
+    const auto& b = pf.timeline[t];
+    rows.push_back({t * mango::DriverProfile::kTimelineBinSeconds, b.batches, b.evaluations,
+                    b.batches ? round3(static_cast<double>(b.activeGamesSum) / static_cast<double>(b.batches)) : 0.0});
+  }
+  return rows;
+}
+#endif
+
+}  // namespace
+
 int main(int argc, char** argv) {
-  std::string model, configPath, outDir, sgfDir, device = "auto", chunkPrefix = "chunk_";
+  std::string model, configPath, outDir, sgfDir, device = "auto", chunkPrefix = "chunk_", profileOut;
   int games = -1, iteration = 0, gamesInFlight = -1, threads = -1, maxBatch = -1;
   uint64_t chunkIdStart = 0, seed = 1;
   bool fp32 = false, noChannelsLast = false, noCudaGraphs = false;
@@ -57,6 +122,7 @@ int main(int argc, char** argv) {
     else if (a == "--games-in-flight") gamesInFlight = std::atoi(next().c_str());
     else if (a == "--threads") threads = std::atoi(next().c_str());
     else if (a == "--max-batch") maxBatch = std::atoi(next().c_str());
+    else if (a == "--profile-out") profileOut = next();
     else if (a == "--resign-threshold") {
       resignThreshold = std::strtof(next().c_str(), nullptr);
       haveResign = true;
@@ -193,11 +259,40 @@ int main(int argc, char** argv) {
     summary["graphs_captured"] = ev.graphsCaptured();
     summary["graph_replays"] = ev.graphReplays();
     summary["iteration"] = iteration;
+    summary["profile"] = profileJson(st, ev.timings());
+    if (!profileOut.empty()) {
+      nlohmann::json full = summary["profile"];
+      full["seconds"] = st.seconds;
+      full["games"] = st.games;
+      full["positions"] = st.positions;
+      full["games_in_flight"] = G;
+      full["model_id"] = ev.modelId();
+      full["device"] = ev.description();
+      full["timeline_columns"] = {"second", "forwards", "evaluations", "avg_games_in_flight"};
+      full["timeline"] = timelineJson(st.profile);
+      const fs::path p(profileOut);
+      if (p.has_parent_path()) fs::create_directories(p.parent_path());
+      std::ofstream f(p);
+      f << full.dump(1) << "\n";
+      if (!f) std::cerr << "mango_selfplay: could not write " << profileOut << "\n";
+    }
     std::cout << summary.dump() << "\n";
     std::cerr << "mango_selfplay: " << st.games << " games, " << st.positions << " positions in " << st.seconds << " s ("
               << summary["positions_per_s"].get<double>() << " pos/s, " << summary["evals_per_s"].get<double>()
               << " evals/s, avg batch " << st.avgBatch() << ", eval " << 100.0 * st.evalSeconds / std::max(st.seconds, 1e-9)
               << "% of wall)\n";
+    const nlohmann::json& pr = summary["profile"];
+    const nlohmann::json& pe = pr["evaluator"];
+    std::cerr << "mango_selfplay: profile: evaluation thread busy " << pr["eval_busy"].get<double>() << " (call "
+              << pr["eval_call_s"].get<double>() << " s = pack " << pe["pack_s"].get<double>() << " + device "
+              << pe["device_s"].get<double>() << " + unpack " << pe["unpack_s"].get<double>() << ", handback "
+              << pr["eval_handback_s"].get<double>() << " s, idle " << pr["eval_wait_s"].get<double>() << " s), "
+              << pe["us_per_call"].get<double>() << " us per call, padded rows " << pe["padded_rows"].get<uint64_t>() << " / "
+              << pe["rows"].get<uint64_t>() << "; search threads busy " << pr["search_busy"].get<double>() << " (collect "
+              << pr["search_collect_s"].get<double>() << " s, commit " << pr["search_commit_s"].get<double>() << " s, callbacks "
+              << pr["search_callback_s"].get<double>() << " s, waiting " << pr["search_wait_s"].get<double>()
+              << " s, summed over " << pr["search_threads"].get<int>() << " thread(s)), rounds per forward "
+              << pr["rounds_per_batch"].get<double>() << "\n";
     return 0;
   } catch (const std::exception& e) {
     std::cerr << "mango_selfplay: " << e.what() << "\n";

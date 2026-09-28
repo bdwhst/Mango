@@ -70,7 +70,8 @@ def main(argv: list[str]) -> int:
     dispatch_dir = run / "fake_dispatch"
     dispatch_dir.mkdir(exist_ok=True)
     (dispatch_dir / f"{time.time_ns()}_{os.getpid()}.json").write_text(
-        json.dumps({"seed": seed, "chunk_id_start": chunk_id, "games": games, "pid": os.getpid()}), encoding="utf-8")
+        json.dumps({"seed": seed, "chunk_id_start": chunk_id, "games": games, "pid": os.getpid(),
+                    "profile_out": opts.get("profile-out")}), encoding="utf-8")
     fail = control.get("fail") if control.get("fail", {}).get("chunk_id_start") == chunk_id else None
     hang = control.get("hang") if control.get("hang", {}).get("chunk_id_start") == chunk_id else None
 
@@ -111,6 +112,7 @@ def main(argv: list[str]) -> int:
         "terminations": {"two_passes": games, "resign": 0, "move_cap": 0},
         "resign_threshold": float(opts.get("resign-threshold", -1.0)), "chunks": published,
         "next_chunk_id": chunk_id, "model_id": model_id, "device": "fake", "iteration": int(opts.get("iteration", 0)),
+        "profile": {"eval_busy": 0.5, "search_busy": 0.25, "rounds_per_batch": 1.0, "evaluator": {"us_per_call": 100.0}},
     }
     print(json.dumps(summary))
     return 0

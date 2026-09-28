@@ -46,6 +46,19 @@ class TorchEvaluator : public NNEvaluator {
 
   void evaluate(const std::vector<NNInput>& in, std::vector<NNOutput>& out) override;
 
+  // Where evaluate() spends its time (DESIGN 5.5.1, "Driver profile"). `device` is the
+  // transfer in, the forward (or replay) and the transfer out, which the copy back to the
+  // host waits for; nsys splits it further.
+  struct Timings {
+    uint64_t calls = 0;
+    uint64_t rows = 0;         // positions evaluated
+    uint64_t paddedRows = 0;   // rows the forwards ran on (a batch is padded to its bucket)
+    double packSeconds = 0.0;    // input planes into the host buffer
+    double deviceSeconds = 0.0;  // host -> device, forward, device -> host
+    double unpackSeconds = 0.0;  // fp32 softmax and the outputs
+  };
+  const Timings& timings() const;
+
   // Fast-path state (false / 0 on MPS and CPU, or when switched off).
   bool channelsLast() const;
   bool cudaGraphs() const;       // still enabled (a failed capture disables it)

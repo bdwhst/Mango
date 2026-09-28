@@ -492,3 +492,105 @@ TEST_CASE("CUDA fast path agrees with the plain path on the model in MANGO_TEST_
     }
   }
 }
+
+TEST_CASE("TorchEvaluator timings count every call, row and padded row") {
+  const auto rows = randomPlanes(40, 5, 99);
+  {
+    TorchEvaluator::Options o;
+    o.device = "cpu";
+    TorchEvaluator ev(kFixture, o);
+    for (size_t batch : {size_t{1}, size_t{7}, size_t{33}}) evaluateRows(ev, rows, 0, batch);
+    const TorchEvaluator::Timings& tm = ev.timings();
+    CHECK(tm.calls == 3);
+    CHECK(tm.rows == 41);
+    CHECK(tm.paddedRows == 41);  // no buckets off CUDA
+    CHECK(tm.packSeconds >= 0.0);
+    CHECK(tm.deviceSeconds > 0.0);
+    CHECK(tm.unpackSeconds >= 0.0);
+  }
+  if (TorchEvaluator::cudaAvailable() && TorchEvaluator::cudaGraphsCompiled()) {
+    TorchEvaluator ev(kFixture, cudaOptions(true, true, true));
+    // 5 pads to bucket 8, 33 to 48 (warm-up and replays alike); 40 pads to 48 too.
+    for (int call = 0; call < 5; ++call) evaluateRows(ev, rows, 0, 5);
+    for (int call = 0; call < 4; ++call) evaluateRows(ev, rows, 0, 33);
+    evaluateRows(ev, rows, 0, 40);
+    const TorchEvaluator::Timings& tm = ev.timings();
+    CHECK(tm.calls == 10);
+    CHECK(tm.rows == 5 * 5 + 4 * 33 + 40);
+    CHECK(tm.paddedRows == 5 * 8 + 4 * 48 + 48);
+  }
+}
+
+// Two evaluators of one model used from two threads at the same time (the capture lock of
+// DESIGN 5.3): every result agrees with a plain evaluator, no capture is lost.
+#include <atomic>
+#include <thread>
+
+TEST_CASE("CUDA fast path: two evaluators used concurrently from two threads") {
+  if (!TorchEvaluator::cudaAvailable()) {
+    MESSAGE("CUDA not available: skipped");
+    return;
+  }
+  const auto rows = randomPlanes(120, 5, 515);
+  TorchEvaluator plain(kFixture, cudaOptions(true, false, false));
+  std::vector<std::vector<NNOutput>> expected;
+  const size_t sizes[] = {7, 64, 1, 33, 120, 16, 90, 3};
+  for (size_t b : sizes) expected.push_back(evaluateRows(plain, rows, 0, b));
+  TorchEvaluator a(kFixture, cudaOptions(true, true, true)), b(kFixture, cudaOptions(true, true, true));
+  std::vector<double> worst(2, 0.0);
+  auto work = [&](TorchEvaluator& ev, size_t k) {
+    for (int round = 0; round < 20; ++round)
+      for (size_t i = 0; i < std::size(sizes); ++i) {
+        const size_t j = (i + k * 3) % std::size(sizes);  // the two threads interleave different buckets
+        worst[k] = std::max(worst[k], maxDiff(evaluateRows(ev, rows, 0, sizes[j]), expected[j]));
+      }
+  };
+  std::thread ta(work, std::ref(a), size_t{0}), tb(work, std::ref(b), size_t{1});
+  ta.join();
+  tb.join();
+  CHECK(worst[0] < 2e-3);
+  CHECK(worst[1] < 2e-3);
+  CHECK(a.graphReplays() > 0);
+  CHECK(b.graphReplays() > 0);
+  if (TorchEvaluator::cudaGraphsCompiled()) {
+    // No capture was invalidated by the other thread's work (the captures are exclusive).
+    CHECK(a.cudaGraphs());
+    CHECK(b.cudaGraphs());
+    CHECK(a.graphsCaptured() == 8);  // buckets 8, 64, 1, 48, 128, 16, 96, 4 of the sizes above
+    CHECK(b.graphsCaptured() == 8);
+  }
+}
+
+// The race behind the exclusive capture: one evaluator replays and allocates without pause
+// while another warms up and captures bucket after bucket. Every capture must succeed.
+TEST_CASE("CUDA fast path: captures succeed while another evaluator keeps the GPU busy") {
+  if (!TorchEvaluator::cudaAvailable() || !TorchEvaluator::cudaGraphsCompiled()) {
+    MESSAGE("CUDA graphs not available: skipped");
+    return;
+  }
+  const auto rows = randomPlanes(1024, 5, 616);
+  TorchEvaluator busy(kFixture, cudaOptions(true, true, true));
+  // `busy` alternates graph replays and plain forwards above the largest bucket (4,096 is
+  // not reached here, so use the unbucketed path of a second, graph-less evaluator too).
+  TorchEvaluator busyPlain(kFixture, cudaOptions(true, true, false));
+  for (int i = 0; i < 4; ++i) evaluateRows(busy, rows, 0, 512);
+  std::atomic<bool> stop{false};
+  std::thread hammer([&] {
+    size_t k = 0;
+    while (!stop.load()) {
+      evaluateRows(busy, rows, 0, 512);
+      evaluateRows(busyPlain, rows, 0, 1 + (k++ * 37) % 1000);  // new shapes: fresh allocations
+    }
+  });
+  TorchEvaluator capturing(kFixture, cudaOptions(true, true, true));
+  int buckets = 0;
+  for (int b = 1; b <= 1024; b = TorchEvaluator::bucketFor(b) + 1) {
+    for (int call = 0; call < 4; ++call) evaluateRows(capturing, rows, 0, static_cast<size_t>(b));
+    ++buckets;
+  }
+  stop = true;
+  hammer.join();
+  CHECK(capturing.cudaGraphs());
+  CHECK(capturing.graphsCaptured() == buckets);
+  CHECK(busy.cudaGraphs());
+}

@@ -98,6 +98,9 @@ def test_processes_plan_failed_worker_and_restart(tmp_path, fake_driver):
     assert plan["processes"] == 3 and plan["workers"] == expected
     first = _dispatches(run)
     assert sorted((d["chunk_id_start"], d["games"]) for d in first) == [(1, 4), (5, 3), (8, 3)]
+    # Every worker writes its own driver profile (DESIGN 5.5.1).
+    assert sorted(Path(d["profile_out"]).name for d in first) == ["0001_k0.json", "0001_k1.json", "0001_k2.json"]
+    assert all(Path(d["profile_out"]).parent == run / "logs" / "selfplay_profile" for d in first)
     assert {d["seed"] for d in first} == {w["seed"] for w in expected}
     assert len({d["seed"] for d in first}) == 3
     assert _chunk_ids(run) == [1, 2, 5, 6, 8]
@@ -190,7 +193,10 @@ def test_processes_one_keeps_the_single_process_path(tmp_path, fake_driver):
     plan = st["plan"]["selfplay"]
     assert "workers" not in plan and "processes" not in plan
     assert plan["seed"] == derive_seed(st["run_seed"], 1) and plan["chunk_id_start"] == 1
-    assert _dispatches(run) == [{**_dispatches(run)[0], "seed": plan["seed"], "chunk_id_start": 1, "games": 10}]
+    assert _dispatches(run) == [{**_dispatches(run)[0], "seed": plan["seed"], "chunk_id_start": 1, "games": 10,
+                                 "profile_out": str(run / "logs" / "selfplay_profile" / "0001.json")}]
     assert _chunk_ids(run) == [1, 2, 3, 4, 5] and st["next_chunk_id"] == 6
     assert (run / "logs" / "selfplay.log").exists()
     assert "processes" not in st["selfplay_stats"]["1"]
+    assert st["selfplay_stats"]["1"]["profile"]["eval_busy"] == 0.5
+    assert "selfplay profile: evaluation thread busy 0.50" in (run / "logs" / "pipeline.log").read_text(encoding="utf-8")

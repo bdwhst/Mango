@@ -313,10 +313,14 @@ void playMatchThreaded(MatchReport& r, MatchPlayer& a, MatchPlayer& b, int n, fl
     queue.abort();
   };
 
+  // Result buffers outlive the search threads: after an abort the evaluation thread may
+  // still write the results of a forward it had started into a finished thread's buffer.
+  std::vector<std::vector<NNOutput>> resultBuffers(static_cast<size_t>(T));
   auto searchThread = [&](int t) {
     std::vector<MatchSlot*> mine;
     for (int i = t; i < G; i += T) mine.push_back(&slots[static_cast<size_t>(i)]);
-    std::vector<NNOutput> outs(mine.size());
+    std::vector<NNOutput>& outs = resultBuffers[static_cast<size_t>(t)];
+    outs.resize(mine.size());
     std::vector<EvalRequest> round;
     std::vector<std::pair<MatchSlot*, NNOutput*>> pending;
     auto abandon = [&] {
