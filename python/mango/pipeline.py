@@ -14,8 +14,19 @@ eval.ladder_every-th candidate to the frozen ladder (DESIGN 6.6). With selfplay.
 >= 2 an iteration's games are split over N mango_selfplay processes from per-worker plan
 records persisted before launch (DESIGN 5.5.1 step 0); N = 1 is the single-process path.
 
+Overlapped evaluation (DESIGN 6.5.1): with pipeline.async_ladder the strength step runs
+as background ladder jobs (one at a time, in iteration order); with pipeline.async_gate
+an iteration's phases are selfplay, settle, train, monitor, export, launch_eval — the
+gate of iteration i runs as a background job while iteration i+1 plays its games and is
+settled after that self-play. Which model plays self-play in iteration j is decided by
+the recorded promotions (`effective_selfplay_iteration`), never by wall-clock order.
+Background jobs are supervisor processes (mango/bgjob.py) in a kill-on-close Job Object
+(Windows) or their own process group (POSIX); only this process writes state.json and
+best.json.
+
     python -m mango.pipeline --run runs/smoke --config configs/5x5-smoke.json \
-        --bin build/windows-cuda/Release --iterations 30 [--device cuda] [--check]
+        --bin build/windows-cuda/Release --iterations 30 [--device cuda] [--check] \
+        [--async-ladder on|off] [--async-gate on|off]
 """
 
 from __future__ import annotations
@@ -23,6 +34,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import platform
 import re
 import subprocess
@@ -39,13 +51,48 @@ from .config import effective_move_cap, load_config, merge_config
 from .data import write_holdout_games
 from .export import export_model_version, load_eager_model, make_model_id
 from .known_outcome import known_positions, value_sign_accuracy
+from .proc import (WINDOWS, FileLock, ForegroundGuard, RunContainer, acquire_run_lock, child_env, release_run_lock,
+                   run_polled, terminate_group)
 from .resign import measured_false_positive_rate, select_resign_threshold
 from .state import derive_seed, read_json, write_json_atomic
-from .strength import Ladder, format_ratings
+from .strength import Ladder, finish_fit_publication, fit_path, format_ratings, ladder_step, strength_record
 from .train import (build_model, build_optimizer, build_window_dataset, bounded_steps, evaluate_dataset,
                     load_checkpoint, make_scaler, save_checkpoint, train_until)
 
-PHASES = ["selfplay", "train", "monitor", "export", "gate", "promote", "strength"]
+# Sequential iteration: selfplay, train, monitor, export, gate, promote, strength. With
+# async_gate: selfplay, settle, train, monitor, export, launch_eval. `settle` also runs in
+# a sequential iteration that follows an asynchronous one (a gate is pending).
+PHASES = ["selfplay", "settle", "train", "monitor", "export", "gate", "promote", "strength", "launch_eval"]
+LAST_PHASES = ("strength", "launch_eval")
+
+
+def select_selfplay_model(promotions: list[dict[str, Any]], iteration: int, initial_model_id: str) -> str:
+    """The self-play model of an iteration (DESIGN 6.5.1): among the promotions with
+    effective_selfplay_iteration <= iteration, the one with the largest
+    (effective_selfplay_iteration, gate_iteration) — never the list order; with none, the
+    run's initial model."""
+    eligible = [p for p in promotions if int(p["effective_selfplay_iteration"]) <= iteration]
+    if not eligible:
+        return initial_model_id
+    return max(eligible, key=lambda p: (int(p["effective_selfplay_iteration"]), int(p["gate_iteration"])))["candidate"]
+
+
+def add_promotion(promotions: list[dict[str, Any]], gate_iteration: int, candidate: str, effective: int) -> bool:
+    """Adds a promotion keyed by (gate_iteration, candidate) unless present."""
+    if any(int(p["gate_iteration"]) == gate_iteration and p["candidate"] == candidate for p in promotions):
+        return False
+    promotions.append({"gate_iteration": int(gate_iteration), "candidate": candidate,
+                       "effective_selfplay_iteration": int(effective)})
+    return True
+
+
+def promotions_from_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The promotion list of a run older than it (every gate was synchronous: e = i + 1)."""
+    promotions: list[dict[str, Any]] = []
+    for ev in events:
+        if ev.get("event") == "gate" and ev.get("promoted"):
+            add_promotion(promotions, int(ev["iteration"]), ev["candidate"], int(ev["iteration"]) + 1)
+    return promotions
 
 
 def pick_device(name: str | None) -> torch.device:
@@ -152,6 +199,14 @@ class Pipeline:
         self.selfplay_device = selfplay_device or (self.device.type if self.device.type != "mps" else "mps")
         self.quiet = quiet
         self.run.mkdir(parents=True, exist_ok=True)
+        # One pipeline per run (DESIGN 6.5.1): refused if another process holds the lock.
+        self._lock_key: str | None = acquire_run_lock(self.run / ".pipeline.lock")
+        self.container = RunContainer()
+        # POSIX: the foreground subprocesses' parent-death protection and lock (proc.ForegroundGuard).
+        self.fg = ForegroundGuard(self.run, log=lambda m: print(m, file=sys.stderr, flush=True))
+        self._bg: dict[str, dict[str, Any]] = {}  # running background jobs by job id
+        self._bg_started = False
+        self._overlap: set[str] = set()
         for sub in ("models", "learner", "replay", "sgf", "matches", "monitor", "logs"):
             (self.run / sub).mkdir(exist_ok=True)
         cfg_path = self.run / "config.json"
@@ -166,6 +221,82 @@ class Pipeline:
         self.state = read_json(self.state_path)
         if self.state is None:
             self._init_run(run_seed if run_seed is not None else 1)
+        self._migrate_state()
+
+    def close(self) -> None:
+        """Stops every background job of this pipeline and releases the run lock."""
+        try:
+            self._terminate_all()
+        finally:
+            self.container.close()
+            if getattr(self, "fg", None) is not None:
+                self.fg.release()
+            if self._lock_key is not None:
+                release_run_lock(self._lock_key)
+                self._lock_key = None
+
+    def __del__(self) -> None:
+        try:
+            if getattr(self, "_lock_key", None) is not None:
+                self.close()
+        except Exception:
+            pass
+
+    def _migrate_state(self) -> None:
+        """Keys added by DESIGN 6.5.1, rebuilt once for a run started by an older version:
+        the promotion list from the recorded gate events (keyed, so a repeat adds nothing;
+        it must reproduce best_model_id, else the run stops rather than change which model
+        plays) and an empty background record."""
+        changed = False
+        if "promotions" not in self.state:
+            promotions = promotions_from_events(self.state.get("events", []))
+            latest = select_selfplay_model(promotions, 1 << 30, self.state["initial_model_id"])
+            if latest != self.state["best_model_id"]:
+                raise RuntimeError(f"cannot rebuild the promotion list: the gate events end at {latest}, "
+                                   f"best_model_id is {self.state['best_model_id']}")
+            self.state["promotions"] = promotions
+            changed = True
+        if "background" not in self.state:
+            self.state["background"] = {"gate": None, "ladder": []}
+            changed = True
+        if changed:
+            self.save_state()
+
+    def _crash_point(self, name: str) -> None:
+        """Test seam: the restart tests raise here to simulate a crash between two steps."""
+
+    def _config_mode(self) -> dict[str, bool]:
+        pl = self.cfg["pipeline"]
+        return {"async_gate": bool(pl["async_gate"]), "async_ladder": bool(pl["async_ladder"])}
+
+    def _mode(self) -> dict[str, bool]:
+        """The switches of the current iteration: read from the config when its self-play
+        plan is written and kept in the plan (a switch changes at iteration boundaries)."""
+        return self.state["plan"].get("mode") or self._config_mode()
+
+    def set_switches(self, async_ladder: bool | None = None, async_gate: bool | None = None) -> None:
+        """Changes pipeline.async_* in the run's config.json (from the next iteration on)."""
+        cfg = read_json(self.run / "config.json")
+        section = cfg.setdefault("pipeline", {})
+        if async_ladder is not None:
+            section["async_ladder"] = bool(async_ladder)
+        if async_gate is not None:
+            section["async_gate"] = bool(async_gate)
+        write_json_atomic(self.run / "config.json", cfg)
+        self.cfg = merge_config(cfg)
+        self.log(f"pipeline switches: {self._config_mode()} (from the next iteration boundary)")
+
+    def _add_event(self, event: dict[str, Any]) -> bool:
+        """Events are keyed by (iteration, event, candidate): a phase re-run after a crash
+        adds nothing twice."""
+        key = (event["iteration"], event["event"], event.get("candidate"))
+        if any((e["iteration"], e["event"], e.get("candidate")) == key for e in self.state["events"]):
+            return False
+        self.state["events"].append(event)
+        return True
+
+    def selfplay_model(self, iteration: int) -> str:
+        return select_selfplay_model(self.state["promotions"], iteration, self.state["initial_model_id"])
 
     # --- helpers ---------------------------------------------------------------------------
 
@@ -192,13 +323,22 @@ class Pipeline:
     def n(self) -> int:
         return int(self.cfg["board"]["size"])
 
-    def _run_subprocess(self, args: list[str], log_name: str) -> str:
+    def _adopt(self, proc: subprocess.Popen) -> None:
+        """A foreground subprocess: into the run's container (Windows), its process group
+        recorded for a restart (POSIX)."""
+        self.container.adopt(proc)
+        self.fg.record(proc)
+
+    def _run_subprocess(self, args: list[Any], log_name: str) -> str:
+        """Runs one command in the run's container, polling the background jobs while it
+        waits (DESIGN 6.5.1); stderr to logs/<log_name>."""
         self.log("exec " + " ".join(str(a) for a in args))
-        with open(self.run / "logs" / log_name, "a", encoding="utf-8") as errlog:
-            proc = subprocess.run([str(a) for a in args], stdout=subprocess.PIPE, stderr=errlog, text=True)
-        if proc.returncode != 0:
-            raise RuntimeError(f"{args[0]} failed with exit code {proc.returncode}; see logs/{log_name}")
-        return proc.stdout
+        cmd, kwargs = self.fg.wrap(args)
+        rc, out = run_polled(cmd, self.run / "logs" / log_name, poll=self._poll_background, started=self._adopt,
+                             popen_kwargs=kwargs)
+        if rc != 0:
+            raise RuntimeError(f"{args[0]} failed with exit code {rc}; see logs/{log_name}")
+        return out
 
     def _run_workers(self, launches: list[tuple[int, list[Any]]], log_prefix: str) -> dict[int, str]:
         """Runs the commands concurrently (stderr to logs/<prefix>_<k>.log) and returns their
@@ -216,7 +356,10 @@ class Pipeline:
                 self.log(f"exec [worker {k}] " + " ".join(str(a) for a in args))
                 errlog = open(self.run / "logs" / f"{log_prefix}_{k}.log", "a", encoding="utf-8")
                 logs.append(errlog)
-                procs[k] = subprocess.Popen([str(a) for a in args], stdout=subprocess.PIPE, stderr=errlog, text=True)
+                cmd, kwargs = self.fg.wrap(args)
+                procs[k] = subprocess.Popen([str(a) for a in cmd], stdout=subprocess.PIPE, stderr=errlog, text=True,
+                                            **kwargs)
+                self._adopt(procs[k])
 
             def read(k: int) -> None:
                 outputs[k] = procs[k].stdout.read()  # type: ignore[union-attr]
@@ -237,6 +380,7 @@ class Pipeline:
                         for j in running:
                             procs[j].terminate()
                 if running:
+                    self._poll_background()
                     time.sleep(0.1)
         finally:
             for p in procs.values():
@@ -282,6 +426,8 @@ class Pipeline:
             "next_chunk_id": 1,
             "global_step": 0,
             "events": [],
+            "promotions": [],
+            "background": {"gate": None, "ladder": []},
         }
         self.save_state()
         self.log(f"initialised run with model {model_id} on {self.device}")
@@ -385,12 +531,21 @@ class Pipeline:
         self.save_state()
         return plan
 
+    def _next_phase(self, phase: str) -> str:
+        if phase == "selfplay":
+            return "settle" if self.state["background"]["gate"] is not None else "train"
+        if phase == "export":
+            return "launch_eval" if self._mode()["async_gate"] else "gate"
+        return {"settle": "train", "train": "monitor", "monitor": "export", "gate": "promote",
+                "promote": "strength"}[phase]
+
     def _end(self, phase: str) -> None:
-        nxt = PHASES[(PHASES.index(phase) + 1) % len(PHASES)]
-        if phase == PHASES[-1]:
+        if phase in LAST_PHASES:
             self.state["iteration"] += 1
             self.state["plan"] = {}
-        self.state["phase"] = nxt
+            self.state["phase"] = "selfplay"
+        else:
+            self.state["phase"] = self._next_phase(phase)
         self.save_state()
 
     def phase_selfplay(self) -> None:
@@ -405,9 +560,13 @@ class Pipeline:
                          f"(false-positive rate {rate if rate is None else f'{rate:.3f}'}, {resign['no_resign_games']} tagged)")
         else:
             resign, v_resign = None, None
+        if "mode" not in self.state["plan"]:
+            self.state["plan"]["mode"] = self._config_mode()  # the switches of this iteration (DESIGN 6.5.1)
         new_plan = {
             "task_id": str(it),
-            "model_id": self.state["best_model_id"],
+            # The recorded promotions decide, not best_model_id (DESIGN 6.5.1; equal to it
+            # in a sequential run).
+            "model_id": self.selfplay_model(it),
             "target_games": int(self.cfg["selfplay"]["games_per_iteration"]),
             "chunk_prefix": f"chunk_{it:04d}_",
             "chunk_id_start": int(self.state["next_chunk_id"]),
@@ -571,7 +730,7 @@ class Pipeline:
         ckpt, step = self._latest_ckpt(max_step=target)
         if plan["window_train_positions"] == 0:
             self.log("train: no training positions in the window; phase skipped")
-            self.state["events"].append({"iteration": it, "event": "train_skipped"})
+            self._add_event({"iteration": it, "event": "train_skipped"})
         elif step < target:
             if ds is None:
                 ds = build_window_dataset([self.run / "replay" / w for w in plan["window"]], self.cfg, seed=derive_seed(it, 7))
@@ -670,33 +829,55 @@ class Pipeline:
             self.log(f"export: {plan['candidate_model_id']} from {ckpt.name} (step {step})")
         self._end("export")
 
-    def phase_gate(self) -> None:
-        it = self.state["iteration"]
-        plan = self._begin("gate", {
-            "candidate_model_id": self.state["plan"]["export"]["candidate_model_id"],
-            "incumbent_model_id": self.state["best_model_id"],
-            "report": f"matches/{it:04d}.json",
-            "match_seed": derive_seed(self.state["run_seed"], 1000 + it),
-        })
-        report_path = self.run / plan["report"]
-        report = read_json(report_path)
+    def _match_command(self) -> list[Any]:
+        """The mango_match executable (tests substitute a scripted driver here)."""
+        return [self.exe("mango_match")]
+
+    def _gate_args(self, plan: dict[str, Any]) -> list[Any]:
+        return self._match_command() + [
+            "--a", self.model_dir(plan["candidate_model_id"]), "--b", self.model_dir(plan["incumbent_model_id"]),
+            "--config", self.run / "config.json", "--pairs", int(self.cfg["eval"]["pairs"]), "--seed", plan["match_seed"],
+            "--out", self.run / plan["report"], "--device", self.selfplay_device, "--games-in-flight",
+            int(self.cfg["selfplay"]["games_in_flight"])]
+
+    def _gate_plan(self, it: int) -> dict[str, Any]:
+        return {"candidate_model_id": self.state["plan"]["export"]["candidate_model_id"],
+                "incumbent_model_id": self.state["best_model_id"], "report": f"matches/{it:04d}.json",
+                "match_seed": derive_seed(self.state["run_seed"], 1000 + it)}
+
+    def _gate_report(self, plan: dict[str, Any]) -> dict[str, Any] | None:
+        """The gate report if it exists and names the plan's candidate, incumbent and seed."""
+        report = read_json(self.run / plan["report"])
         valid = (report is not None and report.get("a") == plan["candidate_model_id"]
                  and report.get("b") == plan["incumbent_model_id"] and report.get("seed") == plan["match_seed"])
-        if not valid:
+        return report if valid else None
+
+    def _write_skipped_gate(self, plan: dict[str, Any]) -> None:
+        write_json_atomic(self.run / plan["report"], {"a": plan["candidate_model_id"], "b": plan["incumbent_model_id"],
+                                                      "seed": plan["match_seed"], "skipped": True})
+
+    def _gate_decision(self, report: dict[str, Any]) -> bool:
+        if report.get("skipped"):
+            return True
+        return bool(report["mean_pair_score"] > float(self.cfg["eval"]["gate_threshold"]))
+
+    def _log_gate(self, report: dict[str, Any], seconds: float) -> None:
+        if report.get("skipped"):
+            return
+        self.log(f"gate: candidate mean pair score {report['mean_pair_score']:.3f} "
+                 f"[{report['ci95'][0]:.3f}, {report['ci95'][1]:.3f}], unique {report['unique_trajectories']}/"
+                 f"{report['games']}, {seconds:.1f}s")
+
+    def phase_gate(self) -> None:
+        it = self.state["iteration"]
+        plan = self._begin("gate", self._gate_plan(it))
+        if self._gate_report(plan) is None:
             if not self.cfg["eval"]["gating"]:
-                write_json_atomic(report_path, {"a": plan["candidate_model_id"], "b": plan["incumbent_model_id"],
-                                                "seed": plan["match_seed"], "skipped": True})
+                self._write_skipped_gate(plan)
             else:
-                args = [self.exe("mango_match"), "--a", self.model_dir(plan["candidate_model_id"]), "--b",
-                        self.model_dir(plan["incumbent_model_id"]), "--config", self.run / "config.json", "--pairs",
-                        int(self.cfg["eval"]["pairs"]), "--seed", plan["match_seed"], "--out", report_path, "--device",
-                        self.selfplay_device, "--games-in-flight", int(self.cfg["selfplay"]["games_in_flight"])]
                 t0 = time.time()
-                self._run_subprocess(args, "match.log")
-                report = read_json(report_path)
-                self.log(f"gate: candidate mean pair score {report['mean_pair_score']:.3f} "
-                         f"[{report['ci95'][0]:.3f}, {report['ci95'][1]:.3f}], unique {report['unique_trajectories']}/"
-                         f"{report['games']}, {time.time() - t0:.1f}s")
+                self._run_subprocess(self._gate_args(plan), "match.log")
+                self._log_gate(read_json(self.run / plan["report"]), time.time() - t0)
         self._end("gate")
 
     def phase_promote(self) -> None:
@@ -704,69 +885,385 @@ class Pipeline:
         gate = self.state["plan"]["gate"]
         plan = self._begin("promote", {"candidate_model_id": gate["candidate_model_id"], "decision": None})
         if plan["decision"] is None:
-            report = read_json(self.run / gate["report"])
-            if report.get("skipped"):
-                plan["decision"] = True
-            else:
-                plan["decision"] = bool(report["mean_pair_score"] > float(self.cfg["eval"]["gate_threshold"]))
+            plan["decision"] = self._gate_decision(read_json(self.run / gate["report"]))
             self.save_state()
         if plan["decision"]:
+            # A synchronous gate: the candidate plays from the next iteration on (DESIGN 6.5.1).
+            if add_promotion(self.state["promotions"], it, plan["candidate_model_id"], it + 1):
+                self.save_state()
             write_json_atomic(self.run / "best.json", {"model_id": plan["candidate_model_id"], "iteration": it})
             self.state["best_model_id"] = plan["candidate_model_id"]
-        self.state["events"].append({"iteration": it, "event": "gate", "candidate": plan["candidate_model_id"],
-                                     "promoted": plan["decision"]})
+        self._add_event({"iteration": it, "event": "gate", "candidate": plan["candidate_model_id"],
+                         "promoted": plan["decision"]})
         self.log(f"promote: {'promoted' if plan['decision'] else 'rejected'} {plan['candidate_model_id']}")
         self._end("promote")
 
+    def _ladder_add(self, iteration: int, promoted: bool) -> bool:
+        every = int(self.cfg["eval"]["ladder_every"])
+        return bool(promoted) or (every > 0 and iteration % every == 0)
+
     def phase_strength(self) -> None:
         """Frozen ladder (DESIGN 6.6): every promoted model and every ladder_every-th
-        candidate is added and plays the anchors and its nearest neighbours."""
+        candidate is added and plays the anchors and its nearest neighbours — inline, or
+        queued for the ladder lane with pipeline.async_ladder (6.5.1)."""
         it = self.state["iteration"]
         promote = self.state["plan"]["promote"]
-        every = int(self.cfg["eval"]["ladder_every"])
-        add = bool(promote["decision"]) or (every > 0 and it % every == 0)
-        plan = self._begin("strength", {"add": add, "model_id": promote["candidate_model_id"],
-                                        "promoted": bool(promote["decision"])})
+        plan = self._begin("strength", {"add": self._ladder_add(it, promote["decision"]),
+                                        "model_id": promote["candidate_model_id"], "promoted": bool(promote["decision"])})
         if plan["add"]:
-            ladder = Ladder(self.run, self.cfg, self.bin, self.state["run_seed"], self.selfplay_device,
-                            runner=self._run_subprocess, log=self.log)
-            t0 = time.time()
-            if not ladder.model_entries():
-                ladder.add_model(self.state["initial_model_id"], 0, False)
-            ladder.add_model(plan["model_id"], it, plan["promoted"])
-            fit = ladder.fit(fit_iteration=it)
-            r = fit["ratings"][plan["model_id"]]
-            self.state.setdefault("strength", {})[str(it)] = {
-                "model_id": plan["model_id"], "elo": r["elo"], "low": r["low"], "high": r["high"], "games": r["games"],
-                "separated": r["separated"], "entries": len(ladder.data["entries"]), "matches": len(ladder.data["matches"]),
-            }
-            self.log(f"strength: {plan['model_id']} rated {r['elo']:.0f} [{r['low']:.0f}, {r['high']:.0f}] Elo "
-                     f"({'separated, ' if r['separated'] else ''}{r['games']} games; ladder {len(ladder.data['entries'])} "
-                     f"entries, {len(ladder.data['matches'])} matches, {time.time() - t0:.0f}s)")
-            self.log("strength ladder:\n" + format_ratings(fit, ladder.data["entries"]))
+            self._strength_step(it, plan["model_id"], plan["promoted"])
         self._end("strength")
 
+    def _strength_step(self, iteration: int, model_id: str, promoted: bool) -> None:
+        if self._mode()["async_ladder"]:
+            self._enqueue_ladder(iteration, model_id, promoted)
+            return
+        # Inline: the ladder files have one writer, and entries arrive in iteration order.
+        self._drain_ladder()
+        ladder = Ladder(self.run, self.cfg, self.bin, self.state["run_seed"], self.selfplay_device,
+                        runner=self._run_subprocess, log=self.log, match_command=self._match_command())
+        t0 = time.time()
+        fit = ladder_step(ladder, self.state["initial_model_id"], model_id, iteration, promoted)
+        self._record_strength(iteration, fit, ladder.data, model_id, time.time() - t0)
+
+    def _record_strength(self, iteration: int, fit: dict[str, Any], ladder_data: dict[str, Any], model_id: str,
+                         seconds: float) -> None:
+        rec = strength_record(fit, ladder_data, model_id)
+        self.state.setdefault("strength", {})[str(iteration)] = rec
+        self.log(f"strength: {model_id} rated {rec['elo']:.0f} [{rec['low']:.0f}, {rec['high']:.0f}] Elo "
+                 f"({'separated, ' if rec['separated'] else ''}{rec['games']} games; ladder {rec['entries']} "
+                 f"entries, {rec['matches']} matches, {seconds:.0f}s)")
+        self.log("strength ladder:\n" + format_ratings(fit, ladder_data["entries"]))
+
+    # --- overlapped evaluation (DESIGN 6.5.1) ------------------------------------------------
+
+    def phase_launch_eval(self) -> None:
+        """async_gate: records the gate of this iteration's candidate (against the incumbent
+        now, effective from iteration + 2), launches it in the background and ends the
+        iteration."""
+        it = self.state["iteration"]
+        bg = self.state["background"]
+        if bg["gate"] is None:
+            g = {"iteration": it, "plan": self._gate_plan(it), "effective_selfplay_iteration": it + 2, "decision": None}
+            if not self.cfg["eval"]["gating"]:
+                self._write_skipped_gate(g["plan"])
+                g["decision"] = True
+            bg["gate"] = g
+            self.save_state()
+        elif int(bg["gate"]["iteration"]) != it:
+            raise RuntimeError(f"a gate of iteration {bg['gate']['iteration']} is still pending in iteration {it}")
+        self._crash_point("launch_eval:recorded")
+        self._ensure_gate_job(bg["gate"])
+        self._end("launch_eval")
+
+    def phase_settle(self) -> None:
+        self._settle()
+        self._end("settle")
+
+    def _settle(self) -> None:
+        """Completes the pending gate (DESIGN 6.5.1 "Settle"): each step idempotent by a
+        stable key, re-run from the first step after any crash."""
+        g = self.state["background"]["gate"]
+        if g is None:
+            return
+        i = int(g["iteration"])
+        plan = g["plan"]
+        cand = plan["candidate_model_id"]
+        # 1. the decision from the report (waiting for the job if needed)
+        if g["decision"] is None:
+            report = self._gate_report(plan)
+            if report is None:
+                self._ensure_gate_job(g)
+                self._wait_job(f"gate_{i:04d}")
+                report = self._gate_report(plan)
+                if report is None:
+                    raise RuntimeError(f"gate job {i} finished without a valid report {plan['report']}")
+            self._crash_point("settle:report")
+            g["decision"] = self._gate_decision(report)
+            self.save_state()
+        self._crash_point("settle:decision")
+        # 2. the promotion (keyed), then best.json
+        if g["decision"]:
+            if add_promotion(self.state["promotions"], i, cand, int(g["effective_selfplay_iteration"])):
+                self.save_state()
+            self._crash_point("settle:promotion")
+            write_json_atomic(self.run / "best.json", {"model_id": cand, "iteration": i})
+            self.state["best_model_id"] = cand
+        # 3. the gating event (keyed)
+        self._add_event({"iteration": i, "event": "gate", "candidate": cand, "promoted": g["decision"]})
+        self.save_state()
+        if g["decision"]:
+            self.log(f"promote: promoted {cand} (gate of iteration {i}; self-play from iteration "
+                     f"{g['effective_selfplay_iteration']})")
+        else:
+            self.log(f"promote: rejected {cand} (gate of iteration {i})")
+        self._crash_point("settle:event")
+        # 4. the strength step of candidate i (queued keyed by iteration, or inline)
+        if self._ladder_add(i, g["decision"]):
+            self._strength_step(i, cand, bool(g["decision"]))
+        self._crash_point("settle:strength")
+        # 5. done
+        self.state["background"]["gate"] = None
+        self.save_state()
+
+    def _enqueue_ladder(self, iteration: int, model_id: str, promoted: bool) -> None:
+        queue = self.state["background"]["ladder"]
+        if any(int(j["iteration"]) == iteration for j in queue) or str(iteration) in self.state.get("strength", {}):
+            return
+        queue.append({"iteration": iteration, "model_id": model_id, "promoted": bool(promoted)})
+        self.save_state()
+        self.log(f"background: ladder job {iteration} queued ({len(queue)} in the lane)")
+        self._pump_ladder()
+
+    def _ensure_gate_job(self, g: dict[str, Any]) -> None:
+        job_id = f"gate_{int(g['iteration']):04d}"
+        if job_id in self._bg or g["decision"] is not None or self._gate_report(g["plan"]) is not None:
+            return
+        spec = {"kind": "gate", "log": "match_bg.log", "command": [str(a) for a in self._gate_args(g["plan"])]}
+        self._launch_job(job_id, spec, g)
+
+    def _pump_ladder(self) -> None:
+        """Starts the head of the ladder queue when the lane is idle; a head whose fit file
+        exists (the job finished, the collection did not) is collected instead."""
+        queue = self.state["background"]["ladder"]
+        while queue and not any(k.startswith("ladder_") for k in self._bg):
+            head = queue[0]
+            if fit_path(self.run / "strength", head["iteration"]).exists():
+                self._collect_ladder(head)
+                continue
+            spec = {"kind": "ladder", "log": "ladder_job.log", "run_seed": self.state["run_seed"], "bin": str(self.bin),
+                    "device": self.selfplay_device, "match_command": [str(a) for a in self._match_command()],
+                    "initial_model_id": self.state["initial_model_id"], "model_id": head["model_id"],
+                    "iteration": int(head["iteration"]), "promoted": bool(head["promoted"])}
+            self._launch_job(f"ladder_{int(head['iteration']):04d}", spec, head)
+            break
+
+    def _collect_ladder(self, head: dict[str, Any]) -> None:
+        it = int(head["iteration"])
+        # The fit file is the job's completion mark, but it is written before ratings.json
+        # and ratings.csv: complete (idempotently) whatever an interruption left unwritten.
+        fit = finish_fit_publication(self.run / "strength", it)
+        ladder_data = read_json(self.run / "strength" / "ladder.json")
+        self._crash_point("collect:read")
+        self._record_strength(it, fit, ladder_data, head["model_id"], float(head.get("seconds", 0.0)))
+        queue = self.state["background"]["ladder"]
+        if queue and int(queue[0]["iteration"]) == it:
+            queue.pop(0)
+        self.save_state()
+
+    def _job_lock(self, job_id: str) -> FileLock:
+        return FileLock(self.run / "jobs" / f"{job_id}.lock")
+
+    def _acquire_job_lock(self, job_id: str, record: dict[str, Any]) -> FileLock:
+        """POSIX relaunch rule: the job lock must be free (every process of an earlier copy
+        of the job has exited). If it is held, the recorded process group is signalled and
+        the lock awaited for up to 60 s; then the run fails rather than start a second writer."""
+        lock = self._job_lock(job_id)
+        if lock.try_acquire():
+            return lock
+        pgid = record.get("pgid")
+        self.log(f"background: {job_id} is still held by process group {pgid}; signalling it")
+        if pgid:
+            terminate_group(int(pgid))
+        deadline = time.time() + 60.0
+        while time.time() < deadline:
+            if lock.try_acquire():
+                return lock
+            time.sleep(0.2)
+        raise RuntimeError(f"background job {job_id}: its lock is still held after 60 s (process group {pgid}); "
+                           f"stop those processes and restart")
+
+    def _launch_job(self, job_id: str, spec: dict[str, Any], record: dict[str, Any]) -> None:
+        """Starts a supervisor (python -m mango.bgjob) for a recorded job: placed in the
+        run's container and its own nested Job Object (Windows) or its own process group
+        holding the job lock (POSIX) before it reads `go` and starts work."""
+        jobs = self.run / "jobs"
+        jobs.mkdir(exist_ok=True)
+        spec = {**spec, "job_id": job_id, "run": str(self.run.resolve())}
+        spec_path = jobs / f"{job_id}.json"
+        write_json_atomic(spec_path, spec)
+        args = [sys.executable, "-m", "mango.bgjob", "--spec", str(spec_path), "--parent-pid", str(os.getpid())]
+        kwargs: dict[str, Any] = {}
+        lock = None
+        if not WINDOWS:
+            lock = self._acquire_job_lock(job_id, record)
+            args += ["--lock-fd", str(lock.fileno())]
+            kwargs = {"pass_fds": (lock.fileno(),), "start_new_session": True}
+        errlog = open(self.run / "logs" / spec["log"], "a", encoding="utf-8")
+        job = self.container.new_job()
+        try:
+            try:
+                proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=errlog, stderr=errlog, text=True,
+                                        env=child_env(), **kwargs)
+            finally:
+                if lock is not None:
+                    lock.release()  # the supervisor holds its inherited copy from here on
+            try:
+                self.container.adopt(proc, job)
+            except BaseException:
+                proc.kill()
+                proc.wait()
+                raise
+        except BaseException:
+            errlog.close()
+            if job is not None:
+                job.close()
+            raise
+        try:
+            proc.stdin.write("go\n")  # type: ignore[union-attr]
+            proc.stdin.close()  # type: ignore[union-attr]
+        except OSError:
+            pass  # the supervisor already exited; the next poll reports it
+        record["pid"] = proc.pid
+        record["pgid"] = None if WINDOWS else proc.pid
+        self.save_state()
+        self._bg[job_id] = {"proc": proc, "job": job, "errlog": errlog, "t0": time.time(), "record": record,
+                            "log": spec["log"]}
+        self._overlap.add(job_id)
+        self.log(f"background: launched {job_id} (pid {proc.pid})")
+
+    def _wait_tree(self, job_id: str, rt: dict[str, Any], stop: bool) -> None:
+        """Returns when no process of the job is alive (DESIGN 6.5.1: nothing reads or
+        relaunches a job before that). `stop` terminates the tree first."""
+        if WINDOWS:
+            job = rt["job"]
+            if stop or job.active_processes() > 0:
+                job.terminate()
+            if not job.wait_empty(60.0):
+                raise RuntimeError(f"background job {job_id}: processes still alive 60 s after termination")
+        else:
+            if stop:
+                terminate_group(rt["proc"].pid)
+            lock = self._job_lock(job_id)
+            deadline = time.time() + 60.0
+            while not lock.try_acquire():
+                if time.time() > deadline:
+                    raise RuntimeError(f"background job {job_id}: processes still alive 60 s after termination")
+                terminate_group(rt["proc"].pid)
+                time.sleep(0.2)
+            lock.release()
+        try:
+            rt["proc"].wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            rt["proc"].kill()
+            rt["proc"].wait()
+        rt["errlog"].close()
+        if rt["job"] is not None:
+            rt["job"].close()
+
+    def _terminate_all(self) -> None:
+        """Stops every background job of this pipeline and waits for their trees."""
+        for job_id in list(self._bg):
+            rt = self._bg.pop(job_id)
+            try:
+                self._wait_tree(job_id, rt, stop=True)
+                self.log(f"background: stopped {job_id}")
+            except Exception as e:  # keep stopping the others
+                self.log(f"background: stopping {job_id} failed: {e}")
+
+    def _poll_background(self) -> None:
+        """Collects finished jobs and starts the next ladder job (at phase boundaries and
+        while the main thread waits for a subprocess). A job that failed stops the run:
+        every background job is terminated, the state keeps it for the restart."""
+        for job_id in list(self._bg):
+            self._overlap.add(job_id)
+            rt = self._bg[job_id]
+            rc = rt["proc"].poll()
+            if rc is None:
+                continue
+            del self._bg[job_id]
+            self._wait_tree(job_id, rt, stop=False)
+            seconds = time.time() - rt["t0"]
+            if rc != 0:
+                self.log(f"background: {job_id} failed with exit code {rc} after {seconds:.1f}s; stopping the run")
+                self._terminate_all()
+                raise RuntimeError(f"background job {job_id} failed with exit code {rc}; see logs/{rt['log']} "
+                                   f"(the restart resumes it)")
+            self.log(f"background: {job_id} finished ({seconds:.1f}s)")
+            if job_id.startswith("gate_"):
+                report = self._gate_report(rt["record"]["plan"])
+                if report is not None:
+                    self._log_gate(report, seconds)
+            else:
+                rt["record"]["seconds"] = round(seconds, 1)
+                self._collect_ladder(rt["record"])
+        self._pump_ladder()
+
+    def _wait_job(self, job_id: str) -> None:
+        while job_id in self._bg:
+            self._poll_background()
+            time.sleep(0.1)
+
+    def _drain_ladder(self) -> None:
+        self._start_background()
+        while self.state["background"]["ladder"] or any(k.startswith("ladder_") for k in self._bg):
+            self._poll_background()
+            time.sleep(0.1)
+
+    def _start_background(self) -> None:
+        """Once per pipeline: relaunch the recorded jobs of an interrupted run (a pending
+        gate without decision and valid report; the head of the ladder queue)."""
+        if self._bg_started:
+            return
+        self._bg_started = True
+        g = self.state["background"]["gate"]
+        if g is not None:
+            self._ensure_gate_job(g)
+        self._pump_ladder()
+
+    def drain(self) -> None:
+        """End of --iterations / --hours (DESIGN 6.5.1): settles a pending gate (its
+        promotion keeps its recorded effective iteration), then empties the ladder lane."""
+        self._start_background()
+        self._settle()
+        self._drain_ladder()
+
     def run_phase(self) -> None:
-        getattr(self, "phase_" + self.state["phase"])()
+        self._start_background()
+        phase, it = self.state["phase"], self.state["iteration"]
+        self._overlap = set(self._bg)
+        self._crash_point("phase:" + phase)
+        t0 = time.time()
+        getattr(self, "phase_" + phase)()
+        seconds = time.time() - t0
+        overlapped = sorted(self._overlap)
+        with open(self.run / "logs" / "phase_times.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps({"iteration": it, "phase": phase, "seconds": round(seconds, 2),
+                                "overlapped": overlapped, "end": round(time.time(), 2)}) + "\n")
+        if overlapped:
+            self.log(f"phase {phase}: {seconds:.1f}s, overlapped: {', '.join(overlapped)}")
+        self._poll_background()
 
     def run_iterations(self, iterations: int) -> None:
-        """Runs until iteration `iterations` has completed all its phases."""
-        while self.state["iteration"] <= iterations:
-            self.run_phase()
+        """Runs until iteration `iterations` has completed all its phases, then drains the
+        background work. Any exception stops every background job first."""
+        try:
+            while self.state["iteration"] <= iterations:
+                self.run_phase()
+            self.drain()
+        except BaseException:
+            self._terminate_all()
+            raise
 
     def run_for_seconds(self, budget: float) -> int:
         """Equal-wall-clock budgets (DESIGN 8.2): runs whole iterations until `budget`
-        seconds have elapsed in this call; the iteration in progress is always completed.
-        Returns the number of iterations completed."""
+        seconds have elapsed in this call; the iteration in progress is always completed,
+        then the background work is drained. Returns the number of iterations completed."""
         t0 = time.time()
         done = 0
-        while True:
-            start = self.state["iteration"]
-            while self.state["iteration"] == start:
-                self.run_phase()
-            done += 1
-            if time.time() - t0 >= budget:
-                return done
+        try:
+            while True:
+                start = self.state["iteration"]
+                while self.state["iteration"] == start:
+                    self.run_phase()
+                done += 1
+                if time.time() - t0 >= budget:
+                    break
+            self.drain()
+        except BaseException:
+            self._terminate_all()
+            raise
+        return done
 
     # --- M3a' learning check ---------------------------------------------------------------
 
@@ -843,17 +1340,27 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--seed", type=int, default=1, help="run seed (new runs only)")
     ap.add_argument("--check", action="store_true", help="run the M3a' learning check at the end")
     ap.add_argument("--check-pairs", type=int, default=None)
+    ap.add_argument("--async-ladder", choices=["on", "off"], default=None,
+                    help="set pipeline.async_ladder in the run's config (DESIGN 6.5.1; from the next iteration)")
+    ap.add_argument("--async-gate", choices=["on", "off"], default=None,
+                    help="set pipeline.async_gate in the run's config (DESIGN 6.5.1; from the next iteration)")
     args = ap.parse_args(argv)
     cfg = load_config(args.config) if args.config else None
     p = Pipeline(args.run, cfg, args.bin, args.device, args.selfplay_device, args.seed)
-    if args.iterations > 0:
-        p.run_iterations(args.iterations)
-    if args.hours > 0:
-        p.run_for_seconds(args.hours * 3600.0)
-    if args.check:
-        result = p.check(args.check_pairs)
-        print(json.dumps(result, indent=2))
-        return 0 if result["pass"] else 3
+    try:
+        if args.async_ladder is not None or args.async_gate is not None:
+            p.set_switches(None if args.async_ladder is None else args.async_ladder == "on",
+                           None if args.async_gate is None else args.async_gate == "on")
+        if args.iterations > 0:
+            p.run_iterations(args.iterations)
+        if args.hours > 0:
+            p.run_for_seconds(args.hours * 3600.0)
+        if args.check:
+            result = p.check(args.check_pairs)
+            print(json.dumps(result, indent=2))
+            return 0 if result["pass"] else 3
+    finally:
+        p.close()
     return 0
 
 

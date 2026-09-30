@@ -38,6 +38,7 @@ TINY = {
     "training": {"res_blocks": 1, "filters": 8, "batch_size": 8, "max_steps_per_iteration": 5, "window_games": 100,
                  "fixed_holdout_iteration": 1},
     "eval": {"pairs": 2, "opening_moves": 2, "ladder_every": 1, "ladder_pairs": 2, "ladder_neighbours": 2},
+    "pipeline": {"async_ladder": False},  # the sequential strength phase (the lane: test_pipeline_async.py)
 }
 
 

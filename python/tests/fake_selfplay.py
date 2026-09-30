@@ -3,7 +3,7 @@ step 0): accepts the driver's command line, publishes valid chunks of synthetic 
 prints the same JSON summary line. A control file <run>/fake_selfplay.json makes a worker
 (identified by its --chunk-id-start) fail after publishing some chunks — once the files
 named in "wait_for" exist — or hang after publishing everything with a .tmp file left
-behind. Every launch writes one record to <run>/fake_dispatch/ (one file per launch, so
+behind (or, with "after_chunks", hang after publishing that many). Every launch writes one record to <run>/fake_dispatch/ (one file per launch, so
 concurrent workers cannot clobber each other's record).
 
     python fake_selfplay.py --games N --out DIR --chunk-prefix P --chunk-id-start K --seed S ...
@@ -90,6 +90,10 @@ def main(argv: list[str]) -> int:
         published.append(name)
         chunk_id += 1
         start += count
+        if hang is not None and "after_chunks" in hang and len(published) >= int(hang["after_chunks"]):
+            sys.stderr.write("fake_selfplay: hanging mid-launch on purpose\n")
+            time.sleep(float(hang.get("seconds", 60)))
+            return 0
         if fail is not None and len(published) >= int(fail.get("after_chunks", 1)):
             # Fail only once the files the test expects from the other workers exist, so the
             # scenario "two workers have published, the third fails" is deterministic.

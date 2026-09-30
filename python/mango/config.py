@@ -3,7 +3,7 @@
 Keys the C++ side does not read (it ignores unknown keys): search.resign_auto,
 search.resign_select_scope, search.resign_fpr_target, selfplay.evict_old_chunks,
 training.fixed_holdout_iteration, eval.ladder_pairs, eval.ladder_neighbours, eval.gtp_anchor, eval.gtp_workers,
-selfplay.processes.
+selfplay.processes, and the section `pipeline`.
 """
 
 from __future__ import annotations
@@ -77,6 +77,10 @@ DEFAULTS: dict[str, dict[str, Any]] = {
     "inference": {  # the CUDA fast path of the C++ evaluator (DESIGN 5.3); ignored on MPS and CPU
         "channels_last": True,
         "cuda_graphs": True,
+    },
+    "pipeline": {  # overlapped evaluation (DESIGN 6.5.1); read at iteration boundaries
+        "async_ladder": True,  # the strength step runs in a background ladder lane (default since 2026-09-29)
+        "async_gate": False,  # the gate of iteration i overlaps self-play of i+1 (deviation D19)
     },
 }
 

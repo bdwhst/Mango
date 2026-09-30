@@ -475,3 +475,100 @@ def test_remeasure_replays_every_match_and_archives_the_old_ladder(tmp_path):
     assert fit["ratings"]["0002-b"]["elo"] > read_json(arch / "ratings.json")["ratings"]["0002-b"]["elo"] + 200
     with pytest.raises(FileExistsError):
         remeasure_ladder(run, cfg, tmp_path, 7, "plain", runner=fake)
+
+
+def _csv_rows(path: Path) -> list[dict]:
+    import csv as _csv
+
+    with open(path, newline="", encoding="utf-8") as f:
+        return list(_csv.DictReader(f))
+
+
+def test_ratings_csv_is_regenerated_from_fits_keyed_by_iteration(tmp_path):
+    """DESIGN 6.5.1 test 7: fits are published by iteration and ratings.csv regenerated,
+    so a repeated fit leaves one set of rows; a legacy CSV is kept as fits_legacy.csv with
+    its rows once, an iteration of it that is fitted again appears only with the new rows,
+    and a migration interrupted after the .tmp copy is redone with the same result."""
+    run, cfg = make_run(tmp_path)
+    strengths = {RANDOM: 0.0, "0000-init": 100.0, "0001-a": 300.0, "0002-b": 450.0}
+    for m in strengths:
+        if m != RANDOM:
+            (run / "models" / m).mkdir()
+    sdir = run / "strength"
+    ladder = Ladder(run, cfg, tmp_path, run_seed=7, runner=FakeMatch(strengths))
+    ladder.add_model("0000-init", 0, False)
+    ladder.add_model("0001-a", 1, True)
+    # A run older than fits/: its CSV holds fit iterations 0 (twice, the old append bug) and 1.
+    legacy_fit0 = ladder.fit(record=False, fit_iteration=0)
+    legacy_fit1 = ladder.fit(record=False, fit_iteration=1)
+    from mango.strength import RATINGS_CSV_FIELDS, fit_rows
+
+    import csv as _csv
+    with open(sdir / "ratings.csv", "w", newline="", encoding="utf-8") as f:
+        w = _csv.DictWriter(f, fieldnames=RATINGS_CSV_FIELDS)
+        w.writeheader()
+        for fit in (legacy_fit0, legacy_fit0, legacy_fit1):
+            for r in fit_rows(fit, ladder.data["entries"]):
+                w.writerow({**r, "elo": r["elo"] - 1.0 if r["elo"] else r["elo"]})  # distinguishable "old" values
+    legacy_text = (sdir / "ratings.csv").read_text(encoding="utf-8")
+    # An interrupted migration: a partial .tmp copy is discarded and the copy redone.
+    (sdir / "fits_legacy.csv.tmp").write_text("partial", encoding="utf-8")
+    ladder.add_model("0002-b", 2, False)
+    ladder.fit(fit_iteration=2)
+    assert (sdir / "fits_legacy.csv").read_text(encoding="utf-8") == legacy_text
+    assert not (sdir / "fits_legacy.csv.tmp").exists()
+    assert sorted(p.name for p in (sdir / "fits").glob("*.json")) == ["0002.json"]
+    rows = _csv_rows(sdir / "ratings.csv")
+    n = len(ladder.data["entries"])
+    assert [r["fit_iteration"] for r in rows] == ["0"] * 6 + ["1"] * 3 + ["2"] * n  # the legacy rows as they were, once
+    after_first = (sdir / "ratings.csv").read_text(encoding="utf-8")
+    # A repeated fit of the same iteration (a restart) changes nothing.
+    ladder.fit(fit_iteration=2)
+    assert (sdir / "ratings.csv").read_text(encoding="utf-8") == after_first
+    assert (sdir / "fits_legacy.csv").read_text(encoding="utf-8") == legacy_text  # not re-migrated
+    # A legacy iteration fitted again: only the new fit's rows for it.
+    ladder.fit(fit_iteration=1)
+    rows = _csv_rows(sdir / "ratings.csv")
+    assert [r["fit_iteration"] for r in rows] == ["0"] * 6 + ["1"] * n + ["2"] * n
+    new1 = [r for r in rows if r["fit_iteration"] == "1"]
+    assert [r["name"] for r in new1] == [e["name"] for e in ladder.data["entries"]]
+    assert float(new1[1]["elo"]) == read_json(sdir / "fits" / "0001.json")["ratings"][new1[1]["name"]]["elo"]
+    assert read_json(sdir / "ratings.json")["fit_iteration"] == 1  # the latest fit
+    # Regeneration is a function of the files: removing ratings.csv and refitting rebuilds it.
+    (sdir / "ratings.csv").unlink()
+    ladder.fit(fit_iteration=1)
+    assert _csv_rows(sdir / "ratings.csv") == rows
+    with pytest.raises(ValueError):
+        ladder.fit(fit_iteration=None)
+
+
+def test_a_run_without_a_csv_has_no_legacy_file(tmp_path):
+    run, cfg = make_run(tmp_path)
+    strengths = {RANDOM: 0.0, "0000-init": 100.0}
+    (run / "models" / "0000-init").mkdir()
+    ladder = Ladder(run, cfg, tmp_path, run_seed=7, runner=FakeMatch(strengths))
+    ladder.add_model("0000-init", 0, False)
+    ladder.fit(fit_iteration=0)
+    ladder.fit(fit_iteration=1)
+    assert not (run / "strength" / "fits_legacy.csv").exists()
+    assert [r["fit_iteration"] for r in _csv_rows(run / "strength" / "ratings.csv")] == ["0", "0", "1", "1"]
+
+
+def test_an_interrupted_fit_publication_is_completed_from_the_fit_file(tmp_path, monkeypatch):
+    import mango.strength as ms
+
+    run, cfg = make_run(tmp_path)
+    (run / "models" / "0000-init").mkdir()
+    ladder = Ladder(run, cfg, tmp_path, run_seed=7, runner=FakeMatch({RANDOM: 0.0, "0000-init": 100.0}))
+    ladder.add_model("0000-init", 0, False)
+    ladder.fit(fit_iteration=0)
+    want = {n: (run / "strength" / n).read_bytes() for n in ("ratings.json", "ratings.csv")}
+    for n in want:
+        (run / "strength" / n).unlink()
+    monkeypatch.setattr(ms, "finish_fit_publication", lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        ladder.fit(fit_iteration=0)  # interrupted after the fit file
+    monkeypatch.undo()
+    assert (run / "strength" / "fits" / "0000.json").exists() and not (run / "strength" / "ratings.json").exists()
+    ms.finish_fit_publication(run / "strength", 0)
+    assert {n: (run / "strength" / n).read_bytes() for n in want} == want

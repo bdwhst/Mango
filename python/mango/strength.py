@@ -4,7 +4,9 @@ runs/<name>/strength/
   openings_v1.json      fixed opening set, generated once per run, never regenerated
   ladder.json           entries (anchors and models) and every match played
   matches/<a>__<b>.json mango_match / GTP-driver reports
-  ratings.json          latest fit; ratings.csv: one row per player per fit (history)
+  fits/<iteration>.json every fit, published by its fit iteration (a repeated fit replaces it)
+  ratings.json          latest fit; ratings.csv: one row per player per fit (history), regenerated
+                        from fits/ and fits_legacy.csv (the CSV of a run older than fits/)
 
 Anchors: "random" (uniform-random legal moves, pinned at 0 Elo), the first promoted
 model, and optionally an external GTP engine (`eval.gtp_anchor`). Each new entry plays
@@ -25,6 +27,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import platform
 import subprocess
 import sys
@@ -36,7 +39,6 @@ from typing import Any, Callable
 import numpy as np
 
 from .config import effective_move_cap, load_config
-from .export import load_metadata
 from .gtp import play_gtp_match
 from .state import derive_seed, read_json, write_json_atomic
 
@@ -220,6 +222,8 @@ def player_model_id(model_dir: str | Path | None) -> str:
     """What mango_match names a player: the model id from model.json, or "random"."""
     if model_dir is None:
         return RANDOM
+    from .export import load_metadata  # imports torch, which a ladder job does not need otherwise
+
     return str(load_metadata(model_dir)["model_id"])
 
 
@@ -245,10 +249,13 @@ def load_openings(path: str | Path, limit: int | None = None) -> list[list[int]]
 
 class Ladder:
     def __init__(self, run_dir: str | Path, cfg: dict[str, Any], bin_dir: str | Path, run_seed: int, device: str = "auto",
-                 runner: Runner = default_runner, log: Callable[[str], None] | None = None):
+                 runner: Runner = default_runner, log: Callable[[str], None] | None = None,
+                 match_command: list[Any] | None = None):
         self.run = Path(run_dir)
         self.cfg = cfg
         self.bin = Path(bin_dir)
+        # The mango_match command line prefix (tests substitute a scripted driver, DESIGN 6.5.1).
+        self.match_command = list(match_command) if match_command else [exe_path(self.bin, "mango_match")]
         self.run_seed = int(run_seed)
         self.device = device
         self.runner = runner
@@ -285,7 +292,7 @@ class Ladder:
     def ensure_openings(self) -> Path:
         """Generated once per run (uniformly random legal moves, k = eval.opening_moves)."""
         if not self.openings_path.exists():
-            args = [exe_path(self.bin, "mango_match"), "--write-openings", self.openings_path, "--config",
+            args = self.match_command + ["--write-openings", self.openings_path, "--config",
                     self.run / "config.json", "--pairs", int(self.cfg["eval"]["ladder_pairs"]), "--openings",
                     int(self.cfg["eval"]["opening_moves"]), "--seed", derive_seed(self.run_seed, 0x0BE1)]
             self.runner(args, "strength.log")
@@ -374,7 +381,7 @@ class Ladder:
                 report = self._play_gtp(x, y, openings, seed)
                 write_json_atomic(report_path, report)
             else:
-                args = [exe_path(self.bin, "mango_match"), "--a", RANDOM if x["kind"] == "random" else self._model_dir(x),
+                args = self.match_command + ["--a", RANDOM if x["kind"] == "random" else self._model_dir(x),
                         "--b", RANDOM if y["kind"] == "random" else self._model_dir(y), "--config", self.run / "config.json",
                         "--openings-file", openings, "--pairs", int(self.cfg["eval"]["ladder_pairs"]), "--seed", seed,
                         "--out", report_path, "--device", self.device, "--games-in-flight",
@@ -429,9 +436,26 @@ class Ladder:
         fit["entries"] = {e["name"]: {k: v for k, v in e.items() if k != "command"} for e in self.data["entries"]}
         fit["residuals"] = predicted_vs_observed(fit, results)
         if record:
-            write_json_atomic(self.dir / "ratings.json", fit)
-            append_ratings_csv(self.dir / "ratings.csv", fit, self.data["entries"])
+            publish_fit(self.dir, fit, self.data["entries"])
         return fit
+
+
+def ladder_step(ladder: Ladder, initial_model_id: str, model_id: str, iteration: int, promoted: bool) -> dict[str, Any]:
+    """The strength step of the pipeline for one model (DESIGN 6.6), inline or as a ladder
+    job (6.5.1): the initial model joins first (iteration 0) when the ladder has no model
+    entry, then the model plays its missing matches and the fit of `iteration` is published.
+    Idempotent: existing entries are kept, reported matches are not replayed."""
+    if not ladder.model_entries():
+        ladder.add_model(initial_model_id, 0, False)
+    ladder.add_model(model_id, iteration, promoted)
+    return ladder.fit(fit_iteration=iteration)
+
+
+def strength_record(fit: dict[str, Any], ladder_data: dict[str, Any], model_id: str) -> dict[str, Any]:
+    """What the pipeline keeps in state.strength[<iteration>]."""
+    r = fit["ratings"][model_id]
+    return {"model_id": model_id, "elo": r["elo"], "low": r["low"], "high": r["high"], "games": r["games"],
+            "separated": r["separated"], "entries": len(ladder_data["entries"]), "matches": len(ladder_data["matches"])}
 
 
 # --- diagnostics of the rating model (M4 review) ---------------------------------------------
@@ -703,11 +727,12 @@ def remeasure_ladder(run_dir: str | Path, cfg: dict[str, Any], bin_dir: str | Pa
     if archive.exists():
         raise FileExistsError(f"{archive} exists; choose another tag")
     archive.mkdir(parents=True)
-    for name in ("ladder.json", "ratings.json", "ratings.csv"):
+    for name in ("ladder.json", "ratings.json", "ratings.csv", "fits_legacy.csv"):
         if (src / name).exists():
             shutil.move(str(src / name), str(archive / name))
-    if (src / "matches").exists():
-        shutil.move(str(src / "matches"), str(archive / "matches"))
+    for name in ("matches", "fits"):
+        if (src / name).exists():
+            shutil.move(str(src / name), str(archive / name))
     if (src / "openings_v1.json").exists():
         shutil.copy2(str(src / "openings_v1.json"), str(archive / "openings_v1.json"))
     log(f"strength: archived the previous ladder to {archive.name}")
@@ -716,7 +741,8 @@ def remeasure_ladder(run_dir: str | Path, cfg: dict[str, Any], bin_dir: str | Pa
         if e["kind"] != "model":
             continue
         ladder.add_model(e["name"], int(e["iteration"]), bool(e.get("promoted")))
-    ladder.fit(fit_iteration=None)
+    # Fits are published by iteration: this one as the fit of the last model entry's iteration.
+    ladder.fit(fit_iteration=max((int(e["iteration"]) for e in ladder.model_entries()), default=0))
     return ladder
 
 
@@ -727,20 +753,98 @@ def hash_name(s: str) -> int:
     return h & 0x7FFFFFFFFFFFFFFF
 
 
-def append_ratings_csv(path: Path, fit: dict[str, Any], entries: list[dict[str, Any]]) -> None:
-    fields = ["fit_iteration", "name", "kind", "iteration", "promoted", "elo", "low", "high", "games", "score", "rated",
-              "separated"]
-    new = not path.exists()
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        if new:
-            w.writeheader()
-        for e in entries:
-            r = fit["ratings"][e["name"]]
-            w.writerow({"fit_iteration": fit.get("fit_iteration"), "name": e["name"], "kind": e["kind"],
-                        "iteration": e.get("iteration"), "promoted": e.get("promoted"), "elo": r["elo"], "low": r["low"],
-                        "high": r["high"], "games": r["games"], "score": r["score"], "rated": r["rated"],
-                        "separated": r["separated"]})
+RATINGS_CSV_FIELDS = ["fit_iteration", "name", "kind", "iteration", "promoted", "elo", "low", "high", "games", "score",
+                      "rated", "separated"]
+
+
+def fit_rows(fit: dict[str, Any], entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The ratings.csv rows of one fit: one per entry, in entry order."""
+    rows = []
+    for e in entries:
+        r = fit["ratings"][e["name"]]
+        rows.append({"fit_iteration": fit.get("fit_iteration"), "name": e["name"], "kind": e["kind"],
+                     "iteration": e.get("iteration"), "promoted": e.get("promoted"), "elo": r["elo"], "low": r["low"],
+                     "high": r["high"], "games": r["games"], "score": r["score"], "rated": r["rated"],
+                     "separated": r["separated"]})
+    return rows
+
+
+def fit_path(strength_dir: str | Path, fit_iteration: int) -> Path:
+    return Path(strength_dir) / "fits" / f"{int(fit_iteration):04d}.json"
+
+
+def _fit_files(strength_dir: Path) -> dict[int, Path]:
+    return {int(p.stem): p for p in (strength_dir / "fits").glob("*.json") if p.stem.isdigit()}
+
+
+def migrate_legacy_ratings_csv(strength_dir: str | Path) -> bool:
+    """Before the first fit file of a run (DESIGN 6.5.1): a ratings.csv written by an older
+    version (appended per fit) is preserved as fits_legacy.csv — copied to
+    fits_legacy.csv.tmp, then renamed; a leftover .tmp is discarded and the copy redone, so
+    an interrupted migration can simply be repeated. Returns True if it migrated now."""
+    import shutil
+
+    d = Path(strength_dir)
+    legacy, tmp = d / "fits_legacy.csv", d / "fits_legacy.csv.tmp"
+    if tmp.exists():
+        tmp.unlink()
+    if legacy.exists() or _fit_files(d) or not (d / "ratings.csv").exists():
+        return False
+    shutil.copyfile(d / "ratings.csv", tmp)
+    os.replace(tmp, legacy)
+    return True
+
+
+def _fit_iteration_key(value: Any) -> int:
+    return -1 if value in (None, "") else int(value)
+
+
+def regenerate_ratings_csv(strength_dir: str | Path) -> None:
+    """ratings.csv from the fit files and the legacy CSV: an iteration with a fit file
+    contributes only that file's rows, every other iteration its legacy rows; sorted by
+    fit iteration, then entry order. Written to a temporary file, then atomically replaced."""
+    d = Path(strength_dir)
+    fits = {k: read_json(p) for k, p in _fit_files(d).items()}
+    rows: list[dict[str, Any]] = []
+    legacy = d / "fits_legacy.csv"
+    if legacy.exists():
+        with open(legacy, newline="", encoding="utf-8") as f:
+            rows = [r for r in csv.DictReader(f) if _fit_iteration_key(r.get("fit_iteration")) not in fits]
+    for k in sorted(fits):
+        rows.extend(fits[k]["csv_rows"])
+    rows.sort(key=lambda r: _fit_iteration_key(r.get("fit_iteration")))  # stable: entry order is kept
+    tmp = d / "ratings.csv.tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=RATINGS_CSV_FIELDS, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+    os.replace(tmp, d / "ratings.csv")
+
+
+def publish_fit(strength_dir: str | Path, fit: dict[str, Any], entries: list[dict[str, Any]]) -> None:
+    """Publishes a fit by its iteration (DESIGN 6.5.1 "Ratings history keyed by
+    iteration"): the legacy migration first, then fits/<iteration>.json (a repeated fit of
+    the same iteration replaces it), ratings.json (the latest fit) and a regenerated
+    ratings.csv. Every step is idempotent, so a fit repeated after a crash adds nothing."""
+    if fit.get("fit_iteration") is None:
+        raise ValueError("a recorded fit needs its fit iteration")
+    d = Path(strength_dir)
+    migrate_legacy_ratings_csv(d)
+    write_json_atomic(fit_path(d, fit["fit_iteration"]), {**fit, "csv_rows": fit_rows(fit, entries)})
+    finish_fit_publication(d, fit["fit_iteration"])
+
+
+def finish_fit_publication(strength_dir: str | Path, fit_iteration: int) -> dict[str, Any]:
+    """The files derived from a published fit file: ratings.json (the fit without its CSV
+    rows) and the regenerated ratings.csv. The fit file is written first, so a publication
+    interrupted after it is completed by calling this again (the pipeline does so whenever
+    it collects a ladder job by its fit file). Idempotent; returns the fit."""
+    d = Path(strength_dir)
+    fit = read_json(fit_path(d, fit_iteration))
+    write_json_atomic(d / "ratings.json", {k: v for k, v in fit.items() if k != "csv_rows"})
+    regenerate_ratings_csv(d)
+    return fit
 
 
 def external_reports(directory: str | Path, name: str, openings: list[list[int]] | None,
