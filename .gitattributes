@@ -3,3 +3,5 @@
 cpp/third_party/** -diff -text linguist-vendored
 # Test fixtures: binary blobs, keep line endings untouched.
 cpp/tests/fixtures/** -diff -text
+# Windows launcher: cmd.exe needs CRLF, whatever core.autocrlf says on the checkout machine.
+Mango.cmd text eol=crlf

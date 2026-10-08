@@ -18,7 +18,10 @@ if(MSVC)
   target_compile_options(mango_flags INTERFACE /W4 /permissive- /utf-8 /EHsc /Zc:__cplusplus /bigobj)
   target_compile_definitions(mango_flags INTERFACE _CRT_SECURE_NO_WARNINGS NOMINMAX)
 else()
-  target_compile_options(mango_flags INTERFACE -Wall -Wextra -Wpedantic)
+  # -ffp-contract=off: Clang fuses `a - b * c` into an FMA by default, which rounds differently
+  # from MSVC (/fp:precise) and GCC (strict -std mode); the byte-exact chunk fixtures and
+  # cross-platform reproducibility (DESIGN 9) need identical float expression evaluation.
+  target_compile_options(mango_flags INTERFACE -Wall -Wextra -Wpedantic -ffp-contract=off)
 endif()
 
 # ---------------------------------------------------------------------------

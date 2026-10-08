@@ -280,9 +280,12 @@ def run_polled(args: list[Any], stderr_path: str | Path, poll: Callable[[], None
     (an exception from `poll` or `started`, KeyboardInterrupt) terminates the process and
     waits for it. Returns (exit code, stdout)."""
     out: list[str] = []
+    # `pass_fds` from the argument and from `popen_kwargs` (ForegroundGuard.wrap on POSIX) are merged.
+    kwargs = dict(popen_kwargs or {})
+    fds = tuple(pass_fds) + tuple(fd for fd in kwargs.pop("pass_fds", ()) if fd not in pass_fds)
     with open(stderr_path, "a", encoding="utf-8") as errlog:
         proc = subprocess.Popen([str(a) for a in args], stdout=subprocess.PIPE, stderr=errlog, text=True,
-                                pass_fds=pass_fds, close_fds=True, **(popen_kwargs or {}))
+                                pass_fds=fds, close_fds=True, **kwargs)
         reader = threading.Thread(target=lambda: out.append(proc.stdout.read()), daemon=True)  # type: ignore[union-attr]
         try:
             if started is not None:
