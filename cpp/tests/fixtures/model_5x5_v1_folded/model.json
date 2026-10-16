@@ -1,0 +1,22 @@
+{
+  "format": "torchscript-v1",
+  "model_id": "0000-9134cd3a",
+  "board_size": 5,
+  "planes": 17,
+  "feature_schema": 1,
+  "rules_id": 1,
+  "komi": 7.5,
+  "move_cap": 50,
+  "res_blocks": 2,
+  "filters": 16,
+  "export_dtype": "float32",
+  "bn_folded": true,
+  "outputs": [
+    "logits",
+    "value"
+  ],
+  "config_fingerprint": "fixture-folded",
+  "torch_version": "2.14.0",
+  "git_hash": "769a4db",
+  "export_time": "2026-10-08T05:53:31Z"
+}

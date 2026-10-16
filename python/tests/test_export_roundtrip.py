@@ -4,7 +4,8 @@ import re
 import pytest
 import torch
 
-from mango.export import export_model_version, load_eager_model, load_metadata, make_model_id
+from mango.export import (ExportVariantMismatch, build_metadata, export_model_version, fold_batchnorm, load_eager_model,
+                          load_metadata, main as export_main, make_model_id)
 from mango.model import AGZNet
 
 
@@ -95,3 +96,91 @@ def test_metadata_is_json_serialisable(tmp_path):
     d = export_model_version(model, tmp_path, iteration=0, komi=7.5, move_cap=50)
     with open(d / "model.json", encoding="utf-8") as f:
         json.load(f)
+
+
+# --- BatchNorm folding at export (DESIGN 6.4, 9 "NN backend, MPS fp16 and BN folding") ---
+
+def _graph_text(model_dir) -> str:
+    return str(torch.jit.load(str(model_dir / "model.pt")).eval().inlined_graph)
+
+
+def _normalised(meta: dict) -> dict:
+    return {k: v for k, v in meta.items() if k not in ("export_time", "git_hash", "bn_folded")}
+
+
+def test_folded_export_has_no_batchnorm_and_matches_the_unfolded_eager_model(tmp_path):
+    torch.manual_seed(11)
+    n = 5
+    model = AGZNet(n, 2, 16)
+    _random_bn_stats(model, n)
+    before = {k: v.clone() for k, v in model.state_dict().items()}
+    d = export_model_version(model, tmp_path / "models", iteration=3, komi=7.5, move_cap=50)  # bn_fold defaults to True
+    meta = load_metadata(d)
+    assert meta["bn_folded"] is True
+    assert "batch_norm" not in _graph_text(d)
+    scripted = torch.jit.load(str(d / "model.pt")).eval()
+    eager = load_eager_model(d)  # weights.pt is the unfolded state dict
+    assert set(eager.state_dict()) == set(before) and all(torch.equal(eager.state_dict()[k], before[k]) for k in before)
+    assert any(k.endswith("running_mean") for k in eager.state_dict())
+    with torch.no_grad():
+        for batch in (1, 64):
+            x = torch.randint(0, 2, (batch, 17, n, n)).float()
+            el, ev = eager(x)
+            sl, sv = scripted(x)
+            assert torch.allclose(el, sl, atol=1e-4) and torch.allclose(ev, sv, atol=1e-4)
+            fl, fv = fold_batchnorm(eager)(x)
+            assert torch.allclose(el, fl, atol=1e-4) and torch.allclose(ev, fv, atol=1e-4)
+    # Folding is a copy: the input model still has its BN modules and statistics.
+    assert isinstance(model.stem_bn, torch.nn.BatchNorm2d)
+    assert all(torch.equal(model.state_dict()[k], before[k]) for k in before)
+
+
+def test_no_bn_fold_reproduces_the_unfolded_export(tmp_path):
+    torch.manual_seed(12)
+    n = 5
+    model = AGZNet(n, 2, 16)
+    _random_bn_stats(model, n)
+    unfolded = export_model_version(model, tmp_path / "a", iteration=1, komi=7.5, move_cap=50, bn_fold=False)
+    folded = export_model_version(model, tmp_path / "b", iteration=1, komi=7.5, move_cap=50, bn_fold=True)
+    assert unfolded.name == folded.name  # same weights, same id
+    mu, mf = load_metadata(unfolded), load_metadata(folded)
+    assert mu["bn_folded"] is False and mf["bn_folded"] is True
+    assert _normalised(mu) == _normalised(mf)
+    expected = build_metadata(model, unfolded.name, 7.5, 50, "", bn_folded=False)
+    assert _normalised(mu) == _normalised(expected)
+    assert "batch_norm" in _graph_text(unfolded)
+    assert torch.equal(torch.load(unfolded / "weights.pt")["stem_bn.running_mean"],
+                       torch.load(folded / "weights.pt")["stem_bn.running_mean"])
+
+
+def test_export_into_a_root_holding_the_other_variant_raises(tmp_path):
+    torch.manual_seed(13)
+    model = AGZNet(5, 1, 8)
+    _random_bn_stats(model, 5)
+    root = tmp_path / "models"
+    d = export_model_version(model, root, iteration=2, komi=7.5, move_cap=50, bn_fold=True)
+    assert export_model_version(model, root, iteration=2, komi=7.5, move_cap=50, bn_fold=True) == d
+    with pytest.raises(ExportVariantMismatch):
+        export_model_version(model, root, iteration=2, komi=7.5, move_cap=50, bn_fold=False)
+    # A directory whose model.json predates the field reads as unfolded.
+    meta = load_metadata(d)
+    del meta["bn_folded"]
+    (d / "model.json").write_text(json.dumps(meta), encoding="utf-8")
+    assert export_model_version(model, root, iteration=2, komi=7.5, move_cap=50, bn_fold=False) == d
+    with pytest.raises(ExportVariantMismatch):
+        export_model_version(model, root, iteration=2, komi=7.5, move_cap=50, bn_fold=True)
+    assert not any(p.name.startswith(".tmp-") for p in root.iterdir())
+
+
+def test_export_cli_reexports_a_version_into_another_root(tmp_path, capsys):
+    torch.manual_seed(14)
+    model = AGZNet(5, 1, 8)
+    _random_bn_stats(model, 5)
+    src = export_model_version(model, tmp_path / "models", iteration=4, komi=6.5, move_cap=40, config_fingerprint="fp")
+    assert export_main(["--model-dir", str(src), "--out", str(tmp_path / "unfolded"), "--no-bn-fold"]) == 0
+    out = tmp_path / "unfolded" / src.name
+    assert str(out) in capsys.readouterr().out
+    mu, ms = load_metadata(out), load_metadata(src)
+    assert mu["bn_folded"] is False and ms["bn_folded"] is True
+    assert _normalised(mu) == _normalised(ms) and mu["komi"] == 6.5 and mu["move_cap"] == 40 and mu["config_fingerprint"] == "fp"
+    assert "batch_norm" in _graph_text(out)

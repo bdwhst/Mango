@@ -30,6 +30,7 @@ ModelMeta ModelMeta::fromJsonText(const std::string& text) {
   get("filters", m.filters);
   if (j.contains("export_dtype")) m.exportDtype = j["export_dtype"].get<std::string>();
   if (j.contains("config_fingerprint")) m.configFingerprint = j["config_fingerprint"].get<std::string>();
+  if (j.contains("bn_folded")) m.bnFolded = j["bn_folded"].get<bool>();
   if (m.format != "torchscript-v1") throw std::runtime_error("unsupported model format: " + m.format);
   return m;
 }

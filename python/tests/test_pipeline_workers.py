@@ -200,3 +200,78 @@ def test_processes_one_keeps_the_single_process_path(tmp_path, fake_driver):
     assert "processes" not in st["selfplay_stats"]["1"]
     assert st["selfplay_stats"]["1"]["profile"]["eval_busy"] == 0.5
     assert "selfplay profile: evaluation thread busy 0.50" in (run / "logs" / "pipeline.log").read_text(encoding="utf-8")
+
+
+# --- inference.bn_fold on restart (DESIGN 6.4, 9 "NN backend, MPS fp16 and BN folding") -----
+
+def test_bn_fold_switch_keeps_an_existing_candidate_and_applies_to_the_next(tmp_path):
+    import torch
+
+    from mango.config import effective_move_cap
+    from mango.export import export_model_version, load_metadata
+    from mango.train import build_model, load_checkpoint
+
+    cfg = merge_config(CFG)
+    run = tmp_path / "run"
+    p = Pipeline(run, cfg, tmp_path, device="cpu", selfplay_device="cpu", quiet=True)
+    initial = p.state["best_model_id"]
+    assert load_metadata(run / "models" / initial)["bn_folded"] is True  # the default
+    # The candidate of iteration 1 (from ckpt_0) exported with the *other* setting, as a
+    # run would have before the config changed.
+    model = build_model(cfg)
+    load_checkpoint(run / "learner" / "ckpt_0.pt", model, None, None, torch.device("cpu"), restore_rng=False)
+    cand = export_model_version(model, run / "models", iteration=1, komi=cfg["board"]["komi"],
+                                move_cap=effective_move_cap(cfg), bn_fold=False)
+    before = {f: (cand / f).read_bytes() for f in ("model.json", "model.pt", "weights.pt")}
+    # Config now says fold; the pipeline reaches the export phase of iteration 1.
+    p.cfg["inference"]["bn_fold"] = True
+    p.state["phase"] = "export"
+    p.save_state()
+    p.phase_export()
+    assert {f: (cand / f).read_bytes() for f in before} == before  # untouched
+    log = (run / "logs" / "pipeline.log").read_text(encoding="utf-8")
+    assert "warning: candidate " + cand.name in log and "bn_folded=False" in log and "inference.bn_fold=True" in log
+    assert f"export: {cand.name}" not in log  # not re-exported
+    assert p.state["phase"] == "gate"
+    # The next new candidate (iteration 2, same weights -> a new id) follows the config.
+    p.state["iteration"] = 2
+    p.state["phase"] = "export"
+    p.state["plan"] = {}
+    p.save_state()
+    p.phase_export()
+    nxt = run / "models" / p.state["plan"]["export"]["candidate_model_id"]
+    assert nxt != cand and load_metadata(nxt)["bn_folded"] is True
+    assert f"export: {nxt.name}" in (run / "logs" / "pipeline.log").read_text(encoding="utf-8")
+
+
+def test_interrupted_initialisation_reuses_an_initial_model_of_the_other_variant(tmp_path):
+    """models/0000-* written by an older version (unfolded), state.json not yet: the restart
+    with bn_fold on must reuse it, warn, and fold from the next new export (DESIGN 6.4)."""
+    import torch
+
+    from mango.config import effective_move_cap
+    from mango.export import export_model_version, load_metadata, make_model_id
+    from mango.train import build_model
+
+    cfg = merge_config(CFG)
+    run = tmp_path / "run"
+    torch.manual_seed(1)  # the run seed the Pipeline below uses -> the same initial weights
+    model = build_model(cfg)
+    initial = export_model_version(model, run / "models", iteration=0, komi=cfg["board"]["komi"],
+                                   move_cap=effective_move_cap(cfg), bn_fold=False)
+    assert initial.name == make_model_id(0, model)
+    before = {f: (initial / f).read_bytes() for f in ("model.json", "model.pt", "weights.pt")}
+    assert not (run / "state.json").exists()
+
+    p = Pipeline(run, cfg, tmp_path, device="cpu", selfplay_device="cpu", run_seed=1, quiet=True)
+    assert p.state["initial_model_id"] == initial.name and p.state["best_model_id"] == initial.name
+    assert {f: (initial / f).read_bytes() for f in before} == before  # reused, not rewritten
+    assert load_metadata(initial)["bn_folded"] is False
+    log = (run / "logs" / "pipeline.log").read_text(encoding="utf-8")
+    assert "warning: initial model " + initial.name in log and "bn_folded=False" in log and "inference.bn_fold=True" in log
+    # The next new export follows the config.
+    p.state["phase"] = "export"
+    p.save_state()
+    p.phase_export()
+    cand = run / "models" / p.state["plan"]["export"]["candidate_model_id"]
+    assert cand != initial and load_metadata(cand)["bn_folded"] is True

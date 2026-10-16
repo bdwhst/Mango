@@ -169,17 +169,55 @@ TEST_CASE("torch evaluator matches the PyTorch reference on CUDA (fp32 and fp16)
   }
 }
 
-TEST_CASE("torch evaluator matches the PyTorch reference on MPS (fp32)") {
+TEST_CASE("torch evaluator matches the PyTorch reference on MPS (fp32 and fp16)") {
   if (!TorchEvaluator::mpsAvailable()) {
     MESSAGE("MPS not available: skipped");
     return;
   }
   Reference ref = loadReference(kFixture);
-  TorchEvaluator::Options o;
-  o.device = "mps";
-  TorchEvaluator ev(kFixture, o);
-  CHECK_FALSE(ev.isHalf());
-  checkAgainstReference(ev, ref, false);
+  {
+    TorchEvaluator::Options o;
+    o.device = "mps";
+    o.fp16 = false;  // --fp32
+    TorchEvaluator ev(kFixture, o);
+    CHECK_FALSE(ev.isHalf());
+    const double err = checkAgainstReference(ev, ref, false);
+    MESSAGE("MPS fp32 max abs error vs PyTorch fp32 reference: " << err);
+  }
+  {
+    TorchEvaluator::Options o;
+    o.device = "mps";  // fp16 is the default on MPS since M4a step 3 (DESIGN 5.3 "MPS path")
+    TorchEvaluator ev(kFixture, o);
+    CHECK(ev.isHalf());
+    CHECK(ev.description().find("fp16") != std::string::npos);
+    checkAgainstReference(ev, ref, true);
+  }
+}
+
+// BatchNorm folded into the convolutions at export (DESIGN 6.4, M4a step 3): the folded
+// fixture was exported from the same weights as model_5x5_v1 and shares its reference
+// outputs; it must pass the same parity checks on every device the build can run.
+TEST_CASE("folded export matches the PyTorch reference on every available device") {
+  const std::string folded = std::string(MANGO_FIXTURE_DIR) + "/model_5x5_v1_folded";
+  ModelMeta m = ModelMeta::load(folded);
+  CHECK(m.bnFolded);
+  CHECK_FALSE(ModelMeta::load(kFixture).bnFolded);  // absent in the old fixture reads as false
+  Reference ref = loadReference(folded);
+  struct Case { const char* device; bool fp16; };
+  std::vector<Case> cases{{"cpu", false}};
+  if (TorchEvaluator::cudaAvailable()) cases.push_back({"cuda", false}), cases.push_back({"cuda", true});
+  if (TorchEvaluator::mpsAvailable()) cases.push_back({"mps", false}), cases.push_back({"mps", true});
+  for (const Case& c : cases) {
+    CAPTURE(c.device);
+    CAPTURE(c.fp16);
+    TorchEvaluator::Options o;
+    o.device = c.device;
+    o.fp16 = c.fp16;
+    TorchEvaluator ev(folded, o);
+    CHECK(ev.isHalf() == c.fp16);
+    const double err = checkAgainstReference(ev, ref, c.fp16);
+    MESSAGE("folded fixture on " << std::string(c.device) << (c.fp16 ? " fp16" : " fp32") << ": max abs error " << err);
+  }
 }
 
 TEST_CASE("auto device selection picks an available device") {

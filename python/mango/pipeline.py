@@ -405,12 +405,31 @@ class Pipeline:
 
     # --- initialisation --------------------------------------------------------------------
 
+    def _export_or_reuse(self, model: torch.nn.Module, iteration: int, model_id: str, what: str) -> Path:
+        """Exports `model` as `models/<model_id>/` with the config's inference.bn_fold, unless the
+        directory already exists (a restart): then it is kept as it is, and if it was exported with
+        the other bn_fold variant a warning is logged — the setting applies from the next new
+        export (DESIGN 6.4). Returns the directory. `what` names the model in the log."""
+        d = self.model_dir(model_id)
+        bn_fold = bool(self.cfg["inference"]["bn_fold"])
+        if not (d / "model.json").exists():
+            export_model_version(model, self.run / "models", iteration=iteration, komi=self.cfg["board"]["komi"],
+                                 move_cap=effective_move_cap(self.cfg), model_id=model_id, bn_fold=bn_fold)
+            return d
+        existing = bool(read_json(d / "model.json").get("bn_folded", False))
+        if existing != bn_fold:
+            self.log(f"warning: {what} {model_id} was exported with bn_folded={existing}, "
+                     f"config inference.bn_fold={bn_fold}; keeping the existing export, "
+                     f"the setting applies from the next new export")
+        return d
+
     def _init_run(self, run_seed: int) -> None:
         torch.manual_seed(run_seed)
         model = build_model(self.cfg)
-        model_dir = export_model_version(model, self.run / "models", iteration=0, komi=self.cfg["board"]["komi"],
-                                         move_cap=effective_move_cap(self.cfg))
-        model_id = model_dir.name
+        # A restart of an interrupted initialisation (models/0000-* written, state.json not yet)
+        # reuses the existing initial model whatever its bn_fold variant.
+        model_id = make_model_id(0, model)
+        self._export_or_reuse(model, 0, model_id, "initial model")
         optimizer = build_optimizer(model.to(self.device), self.cfg)
         save_checkpoint(self.run / "learner" / "ckpt_0.pt", model, optimizer, make_scaler(self.device), 0, self.cfg)
         write_json_atomic(self.run / "best.json", {"model_id": model_id, "iteration": 0})
@@ -823,10 +842,11 @@ class Pipeline:
         load_checkpoint(ckpt, model, None, None, torch.device("cpu"), restore_rng=False)
         plan = self._begin("export", {"input_ckpt": ckpt.name, "candidate_model_id": make_model_id(it, model)})
         d = self.model_dir(plan["candidate_model_id"])
-        if not (d / "model.json").exists():
-            export_model_version(model, self.run / "models", iteration=it, komi=self.cfg["board"]["komi"],
-                                 move_cap=effective_move_cap(self.cfg), model_id=plan["candidate_model_id"])
-            self.log(f"export: {plan['candidate_model_id']} from {ckpt.name} (step {step})")
+        fresh = not (d / "model.json").exists()
+        self._export_or_reuse(model, it, plan["candidate_model_id"], "candidate")
+        if fresh:
+            self.log(f"export: {plan['candidate_model_id']} from {ckpt.name} (step {step}, "
+                     f"bn_fold {bool(self.cfg['inference']['bn_fold'])})")
         self._end("export")
 
     def _match_command(self) -> list[Any]:

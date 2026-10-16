@@ -21,6 +21,7 @@ struct ModelMeta {
   int filters = 0;
   std::string exportDtype;
   std::string configFingerprint;
+  bool bnFolded = false;  // BatchNorm folded into the convolutions at export (DESIGN 6.4); absent = false
 
   static ModelMeta load(const std::string& modelDir);  // reads <modelDir>/model.json
   static ModelMeta fromJsonText(const std::string& text);

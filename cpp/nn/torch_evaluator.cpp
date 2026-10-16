@@ -178,7 +178,10 @@ TorchEvaluator::TorchEvaluator(const std::string& modelDir, const Options& optio
   c10::InferenceMode guard;
   impl_->module = torch::jit::load(modelDir + "/model.pt", impl_->device);
   impl_->module.eval();
-  if (dev == "cuda" && options.fp16) {
+  // fp16 on CUDA and, since M4a step 3, on MPS (DESIGN 5.3 "MPS path": the Mac is
+  // forward-bound and fp16 halves the per-row cost at the DESIGN 9 fp16 tolerances).
+  // CPU stays fp32; --fp32 (options.fp16 = false) forces fp32 everywhere.
+  if ((dev == "cuda" || dev == "mps") && options.fp16) {
     impl_->module.to(torch::kHalf);
     impl_->dtype = torch::kHalf;
   }

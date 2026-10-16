@@ -74,9 +74,10 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "gtp_workers": 4,         # parallel engine trios for a GTP match (scripts/vs_gnugo.py; games sequential per trio)
         "threads": 1,  # search threads of mango_match (1 = the first-version driver), DESIGN 5.5.1
     },
-    "inference": {  # the CUDA fast path of the C++ evaluator (DESIGN 5.3); ignored on MPS and CPU
-        "channels_last": True,
-        "cuda_graphs": True,
+    "inference": {  # the C++ evaluator's fast paths (DESIGN 5.3) and the export (DESIGN 6.4)
+        "channels_last": True,  # CUDA only, fp16 only
+        "cuda_graphs": True,  # CUDA only
+        "bn_fold": True,  # BatchNorm folded into the convolutions at export (M4a step 3); new exports only
     },
     "pipeline": {  # overlapped evaluation (DESIGN 6.5.1); read at iteration boundaries
         "async_ladder": True,  # the strength step runs in a background ladder lane (default since 2026-09-29)

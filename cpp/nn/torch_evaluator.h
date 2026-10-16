@@ -21,7 +21,7 @@ class TorchEvaluator : public NNEvaluator {
  public:
   struct Options {
     std::string device = "auto";  // auto | cuda | mps | cpu
-    bool fp16 = true;             // only honoured on CUDA
+    bool fp16 = true;             // honoured on CUDA and MPS (DESIGN 5.3 "MPS path"); CPU is fp32
     // CUDA fp32 only: let cuDNN/cuBLAS use TF32 tensor cores (10-bit mantissa) for fp32 convs
     // and matmuls. LibTorch enables TF32 for cuDNN by default; we turn it off so "fp32"
     // means IEEE fp32 and matches the PyTorch reference to 1e-4. Irrelevant under fp16.
